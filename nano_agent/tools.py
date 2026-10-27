@@ -1,0 +1,89 @@
+import inspect
+import importlib.util
+from pathlib import Path
+from typing import get_type_hints, Any, Callable, Dict
+
+def generate_tool_schema(func: Callable) -> Dict[str, Any]:
+    """
+    Converts a Python function into an OpenAI-compatible tool schema.
+    Uses the function's docstring for the description and type hints for the parameters.
+    """
+    name = func.__name__
+    doc = inspect.getdoc(func) or "No description provided."
+    
+    # Extract type hints
+    hints = get_type_hints(func)
+    params = {}
+    
+    # Get the function signature for default values
+    sig = inspect.signature(func)
+    
+    for param_name, param in sig.parameters.items():
+        # Map Python types to JSON types
+        py_type = hints.get(param_name, Any)
+        
+        # Basic type mapping
+        type_map = {
+            str: "string",
+            int: "integer",
+            float: "number",
+            bool: "boolean",
+            list: "array",
+            dict: "object",
+            Any: "string"
+        }
+        json_type = type_map.get(py_type, "string")
+        
+        params[param_name] = {
+            "type": json_type,
+            "description": f"The {param_name} parameter"
+        }
+        
+        if param.default is not inspect.Parameter.empty:
+            params[param_name]["default"] = param.default
+
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": doc,
+            "parameters": {
+                "type": "object",
+                "properties": params,
+                "required": [n for n, p in sig.parameters.items() if p.default is inspect.Parameter.empty]
+            }
+        },
+        "unsafe": getattr(func, "unsafe", False)
+    }
+
+class ToolRegistry:
+    def __init__(self, tools_dir: str):
+        self.tools_dir = Path(tools_dir)
+        self.tools: Dict[str, Callable] = {}
+        self.schemas: list = []
+
+    def load_tools(self):
+        """Dynamically loads Python functions from the tools directory."""
+        for file in self.tools_dir.glob("*.py"):
+            if file.name == "__init__.py":
+                continue
+            
+            # Import the module dynamically
+            spec = importlib.util.spec_from_file_location(file.stem, file)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            
+            # Find all functions in the module
+            for name, obj in inspect.getmembers(module, inspect.isfunction):
+                if obj.__module__ == module.__name__:
+                    self.tools[name] = obj
+                    self.schemas.append(generate_tool_schema(obj))
+
+    def execute(self, name: str, args: dict) -> str:
+        if name not in self.tools:
+            return f"Error: Tool {name} not found."
+        try:
+            result = self.tools[name](**args)
+            return str(result)
+        except Exception as e:
+            return f"Error executing {name}: {str(e)}"
