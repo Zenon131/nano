@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-agent"
+version = "0.1.0"
+description = "The Transparent Shell Agent"
+dependencies = [
+    "openai",
+    "rich",
+    "python-dotenv",
+]
+
+[project.scripts]
+nano = "nano_agent.cli:main"

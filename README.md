@@ -6,11 +6,11 @@ Nano is a minimalist, open-source AI agent harness that lives in your terminal. 
 ## 🚀 Quick Start (2 Minutes)
 
 ### 1. Install
-Clone the repo and install the dependencies:
+Clone the repo and install as an editable package:
 ```bash
 git clone https://github.com/yourusername/nano.git
 cd nano
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ### 2. Configure
@@ -20,30 +20,39 @@ OPENAI_API_KEY=your_api_key_here
 ```
 
 ### 3. Run
-Launch Nano and start chatting:
+Since you installed it as a package, you can now run Nano from **anywhere**:
 ```bash
-export PYTHONPATH=$PYTHONPATH:$(pwd)
-python3 -m nano_agent.cli
+nano
 ```
 
 ---
 
-## 🛠️ Advanced Usage
+## 🧠 Model & Provider Management
+
+Nano is provider-agnostic. It works with OpenAI, any OpenAI-compatible API, and local models via Ollama.
+
+### ⚡ Slash Commands
+While chatting, use these commands to change your agent's brain:
+
+*   `/model`: Opens a visual selector. It automatically discovers your local Ollama models and lists your configured custom models.
+*   `/config`: Opens the configuration menu to update your **Base API URL**, **API Key**, or add **Manual Models**.
 
 ### 🏠 Local Models (Ollama)
-Want to run Nano 100% locally? Create a `.nano.json` file in your current directory:
-```json
-{
-  "model": "llama3",
-  "base_url": "http://localhost:11434/v1",
-  "api_key": "ollama",
-  "system_prompt": "You are Nano, running locally. Be concise.",
-  "tools_dir": "tools"
-}
-```
+To run Nano 100% locally, ensure Ollama is running and use `/model` to select a local model. Nano will automatically configure the endpoint to `http://localhost:11434/v1`.
 
 ### 📁 Project-Specific Context
 Drop a `.nano.json` into any project folder. Nano will automatically detect it and adopt the project's personality, model, and toolset.
+
+---
+
+## 🛠️ Capabilities & Extensibility
+
+### 🔋 Built-in Powers
+Out of the box, Nano can:
+*   **Explore**: List directories and read files.
+*   **Manipulate**: Create new files (`write_file`) and surgically edit existing ones (`edit_file`).
+*   **Execute**: Run shell commands via `run_command`.
+*   **Delegate**: Spawn specialized sub-agents for complex, multi-step reasoning.
 
 ### 🔌 Adding Your Own Tools
 Nano's extensibility is "zero-config." To give Nano a new power:
@@ -63,17 +72,20 @@ def get_weather(city: str):
 
 ## 🛡️ Safety & Transparency
 *   **Transparent Execution**: Every tool call is rendered in a distinct cyan panel; every result in a green panel.
-*   **Safety Gates**: Any tool marked as `unsafe` (like `run_command`) will trigger a manual confirmation prompt before execution.
-*   **Recursive Intelligence**: Nano can spawn "sub-agents" to handle complex sub-tasks independently.
+*   **Safety Gates**: Any tool marked as `unsafe` (like `run_command`, `write_file`, or `edit_file`) will trigger a manual confirmation prompt before execution.
+*   **Recursive Intelligence**: Nano can spawn \"sub-agents\" to handle complex sub-tasks independently.
+*   **Session Memory**: Conversations are persisted in `.nano_history` so you can pick up where you left off.
 
 ## ⌨️ Commands
 *   `exit` / `quit`: Stop the agent.
-*   `python3 -m nano_agent.cli --new`: Start a fresh session (wipes history).
+*   `/model`: Change the active AI model.
+*   `/config`: Update API keys and endpoints.
+*   `nano --new`: Start a fresh session (wipes history).
 
 ---
 
 ## 💡 Pro-Tip
-To make Nano a global command, add this alias to your `.zshrc` or `.bashrc`:
+If you didn't use `pip install -e .`, you can still run Nano by adding this alias to your `.zshrc` or `.bashrc`:
 ```bash
 alias nano='export PYTHONPATH=$PYTHONPATH:/absolute/path/to/nano && python3 -m nano_agent.cli'
 ```

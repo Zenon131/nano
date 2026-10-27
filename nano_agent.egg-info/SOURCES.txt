@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+nano_agent/__init__.py
+nano_agent/cli.py
+nano_agent/core.py
+nano_agent/tools.py
+nano_agent.egg-info/PKG-INFO
+nano_agent.egg-info/SOURCES.txt
+nano_agent.egg-info/dependency_links.txt
+nano_agent.egg-info/entry_points.txt
+nano_agent.egg-info/requires.txt
+nano_agent.egg-info/top_level.txt

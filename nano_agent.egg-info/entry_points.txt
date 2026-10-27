@@ -1,0 +1,2 @@
+[console_scripts]
+nano = nano_agent.cli:main
