@@ -15,6 +15,9 @@ from dotenv import load_dotenv
 load_dotenv()
 console = Console()
 
+# SET TO True to see exactly what is sent to the LLM
+DEBUG = True
+
 class SessionManager:
     def __init__(self, history_file: str = ".nano_history"):
         self.path = Path(history_file)
@@ -37,23 +40,27 @@ class SessionManager:
             self.path.unlink()
 
 class Nano:
-    def __init__(self, tools_dir: str, model: str = "gpt-4o", 
+    def __init__(self, tools_dir: Optional[str] = None, model: str = "gpt-4o", 
                  confirm_callback: Optional[Callable[[str, Dict], bool]] = None,
                  is_subagent: bool = False):
         
+        # 1. Project Config Load
         config = self._load_config()
         self.model = config.get("model", model)
         
-        system_prompt = config.get("system_prompt", (
-            "You are Nano, a transparent terminal AI agent. "
-            "You have access to tools with different priority levels. "
-            "HIERARCHY RULE: You MUST prioritize tools based on their priority tags. "
-            "1. [PRIORITY: HIGH] - Use these first for any direct action. "
-            "2. [PRIORITY: MEDIUM] - Use these only if basic tools are insufficient. "
-            "3. [PRIORITY: LOW] - These are LAST RESORTS. "
-            "NEVER spawn a sub-agent for a task that can be handled by a basic tool (e.g., listing files, reading a file, or running a simple shell command). "
-            "Be concise and direct."
-        ))
+        # ULTIMATE SYSTEM PROMPT: No more "suggestions", only " identities".
+        project_prompt = config.get("system_prompt", "You are Nano, a transparent terminal AI agent.")
+        
+        self.system_prompt = (
+            f"{project_prompt}\n\n"
+            "IDENTITY: You are a Terminal AI Agent. You do NOT chat about your limitations. "
+            "You execute tasks using tools. If a tool exists for a task, you MUST use it. "
+            "NEVER ask the user to run a command and paste the output if you have a tool for it.\n\n"
+            "TOOL HIERARCHY:\n"
+            "1. Use basic tools (filesystem, shell) for all direct requests.\n"
+            "2. Use spawn_sub_agent ONLY for multi-step complex reasoning.\n"
+            "3. You are strictly forbidden from telling the user you cannot see the filesystem."
+        )
         
         self.base_url = config.get("base_url") 
         self.api_key = config.get("api_key", os.getenv("OPENAI_API_KEY", "ollama"))
@@ -63,19 +70,39 @@ class Nano:
             base_url=self.base_url
         )
         
-        self.registry = ToolRegistry(config.get("tools_dir", tools_dir))
+        # ALWAYS define package_root relative to this file for absolute resolution
+        package_root = Path(__file__).parent.parent
+        
+        if tools_dir is None:
+            tools_dir = str(package_root / "tools")
+        
+        # Resolve tools_dir from config or default
+        config_tools_dir = config.get("tools_dir")
+        if config_tools_dir:
+            config_path = Path(config_tools_dir)
+            if not config_path.is_absolute():
+                # If relative, resolve relative to the package root, not CWD
+                final_tools_dir = str(package_root / config_path)
+            else:
+                final_tools_dir = config_tools_dir
+        else:
+            final_tools_dir = tools_dir
+        
+        self.registry = ToolRegistry(final_tools_dir)
         self.registry.load_tools()
         self._register_core_tools()
         
-        # Sort tools by priority (1, 2, 3)
+        # Sort tools by priority
         self.registry.schemas.sort(key=lambda x: x.get("priority", 1))
         
         self.session = SessionManager()
         self.messages = self.session.load_session()
         self.confirm_callback = confirm_callback
         
-        if not self.messages:
-            self.messages = [{"role": "system", "content": system_prompt}]
+        if self.messages:
+            self.messages[0] = {"role": "system", "content": self.system_prompt}
+        else:
+            self.messages = [{"role": "system", "content": self.system_prompt}]
         
         if is_subagent:
             self.session = None 
@@ -147,7 +174,7 @@ class Nano:
             self.api_key = new_config.get("api_key", "ollama")
             self.base_url = new_config.get("base_url")
             self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-            console.print(f"\n[bold green]✓ Model switched to {self.model}[/bold green]\n")
+            console.print(f"\\n[bold green]✓ Model switched to {self.model}[/bold green]\\n")
         except (ValueError, IndexError):
             console.print("[bold red]Invalid selection.[/bold red]")
 
@@ -177,15 +204,12 @@ class Nano:
 
     def _register_core_tools(self):
         def spawn_sub_agent(goal: str):
-            # Tool description is handled in generate_tool_schema based on docstring
-            # But here we just define the function
             if not hasattr(self, 'session') or self.session is None:
                 return "Error: Sub-agents cannot spawn further sub-agents to prevent recursive loops."
             sub = Nano(tools_dir=self.registry.tools_dir, model=self.model, is_subagent=True)
             sub.messages[0]["content"] = f"You are a Nano sub-agent. Your specific goal is: {goal}. Provide a final answer when complete."
             return sub.run(goal)
         
-        # We'll attach the docstring manually here for generate_tool_schema to find
         spawn_sub_agent.__doc__ = "Spawns a specialized sub-agent for complex multi-step tasks. DO NOT use for simple direct actions."
         self.registry.tools["spawn_sub_agent"] = spawn_sub_agent
         self.registry.schemas.append(generate_tool_schema(spawn_sub_agent, priority=3))
@@ -198,7 +222,15 @@ class Nano:
             self._handle_api_config()
             return "Configuration updated."
         self.messages.append({"role": "user", "content": user_input})
+        
         while True:
+            if DEBUG:
+                console.print(Panel(Text(json.dumps({
+                    "model": self.model,
+                    "messages": self.messages,
+                    "tools": self.registry.schemas
+                }, indent=2), style="dim"), title="DEBUG: API Request"))
+
             stream = self.client.chat.completions.create(
                 model=self.model,
                 messages=self.messages,

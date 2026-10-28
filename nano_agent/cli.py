@@ -20,7 +20,8 @@ def main():
     console.print("[bold magenta]Nano[/bold magenta] - The Transparent Shell Agent")
     console.print("Type 'exit' or 'quit' to stop.\n")
     
-    tools_dir = os.path.join(os.getcwd(), "tools")
+    # Let the Nano core handle the default tools directory resolution
+    tools_dir = None
     
     try:
         agent = Nano(

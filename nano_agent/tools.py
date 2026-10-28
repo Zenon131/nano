@@ -11,14 +11,6 @@ def generate_tool_schema(func: Callable, priority: int = 1) -> Dict[str, Any]:
     name = func.__name__
     doc = inspect.getdoc(func) or "No description provided."
     
-    # Add priority weighting to the description to guide the LLM
-    priority_map = {
-        1: "[PRIORITY: HIGH - Use this for simple, direct actions]",
-        2: "[PRIORITY: MEDIUM - Use this for complex operations]",
-        3: "[PRIORITY: LOW - LAST RESORT - Use only if no other tool suffices]"
-    }
-    enhanced_doc = f"{priority_map.get(priority, '')} {doc}"
-    
     hints = get_type_hints(func)
     params = {}
     sig = inspect.signature(func)
@@ -46,7 +38,7 @@ def generate_tool_schema(func: Callable, priority: int = 1) -> Dict[str, Any]:
         "type": "function",
         "function": {
             "name": name,
-            "description": enhanced_doc,
+            "description": doc,
             "parameters": {
                 "type": "object",
                 "properties": params,
@@ -59,16 +51,24 @@ def generate_tool_schema(func: Callable, priority: int = 1) -> Dict[str, Any]:
 
 class ToolRegistry:
     def __init__(self, tools_dir: str):
-        self.tools_dir = Path(tools_dir)
+        # Force absolute resolution to prevent path-drift during global execution
+        self.tools_dir = Path(tools_dir).resolve()
         self.tools: Dict[str, Callable] = {}
         self.schemas: list = []
 
     def load_tools(self):
         """Dynamically loads Python functions from the tools directory."""
-        for file in self.tools_dir.glob("*.py"):
-            if file.name == "__init__.py":
-                continue
-            
+        if not self.tools_dir.exists() or not self.tools_dir.is_dir():
+            # We throw a hard error here because Nano cannot function without its tools
+            raise FileNotFoundError(f"CRITICAL: Tools directory not found at {self.tools_dir}")
+
+        files = list(self.tools_dir.glob("*.py"))
+        files = [f for f in files if f.name != "__init__.py"]
+
+        if not files:
+            raise FileNotFoundError(f"CRITICAL: No tool files found in {self.tools_dir}")
+
+        for file in files:
             spec = importlib.util.spec_from_file_location(file.stem, file)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
