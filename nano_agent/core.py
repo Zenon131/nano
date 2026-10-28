@@ -41,12 +41,20 @@ class Nano:
                  confirm_callback: Optional[Callable[[str, Dict], bool]] = None,
                  is_subagent: bool = False):
         
-        # 1. Project Config Load
         config = self._load_config()
         self.model = config.get("model", model)
-        system_prompt = config.get("system_prompt", "You are Nano, a transparent terminal AI agent. Be concise and direct.")
         
-        # Provider Configuration
+        system_prompt = config.get("system_prompt", (
+            "You are Nano, a transparent terminal AI agent. "
+            "You have access to tools with different priority levels. "
+            "HIERARCHY RULE: You MUST prioritize tools based on their priority tags. "
+            "1. [PRIORITY: HIGH] - Use these first for any direct action. "
+            "2. [PRIORITY: MEDIUM] - Use these only if basic tools are insufficient. "
+            "3. [PRIORITY: LOW] - These are LAST RESORTS. "
+            "NEVER spawn a sub-agent for a task that can be handled by a basic tool (e.g., listing files, reading a file, or running a simple shell command). "
+            "Be concise and direct."
+        ))
+        
         self.base_url = config.get("base_url") 
         self.api_key = config.get("api_key", os.getenv("OPENAI_API_KEY", "ollama"))
         
@@ -58,6 +66,9 @@ class Nano:
         self.registry = ToolRegistry(config.get("tools_dir", tools_dir))
         self.registry.load_tools()
         self._register_core_tools()
+        
+        # Sort tools by priority (1, 2, 3)
+        self.registry.schemas.sort(key=lambda x: x.get("priority", 1))
         
         self.session = SessionManager()
         self.messages = self.session.load_session()
@@ -86,7 +97,6 @@ class Nano:
             json.dump(config, f, indent=2)
 
     def _get_ollama_models(self) -> List[str]:
-        """Fetches available models from a local Ollama instance."""
         try:
             response = requests.get("http://localhost:11434/api/tags", timeout=2)
             if response.status_code == 200:
@@ -97,7 +107,6 @@ class Nano:
         return []
 
     def _handle_model_selection(self):
-        """Creates a professional selection menu for models."""
         ollama_models = self._get_ollama_models()
         config = self._load_config()
         manual_models = config.get("manual_models", [])
@@ -123,39 +132,28 @@ class Nano:
             table.add_row(str(idx), f"{marker} {opt['name']}", opt["provider"])
 
         console.print(Panel(table, title="Model Selector", border_style="magenta"))
-        
         choice = Prompt.ask("[bold magenta]Select a model number[/bold magenta]")
         
         try:
             idx = int(choice) - 1
             selected = all_options[idx]
             self.model = selected["name"]
-            
             updates = {"model": self.model}
             if selected["provider"] == "Ollama (Local)":
                 updates["base_url"] = "http://localhost:11434/v1"
                 updates["api_key"] = "ollama"
-            
             self._save_config(updates)
             new_config = self._load_config()
             self.api_key = new_config.get("api_key", "ollama")
             self.base_url = new_config.get("base_url")
             self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-            
             console.print(f"\n[bold green]✓ Model switched to {self.model}[/bold green]\n")
         except (ValueError, IndexError):
             console.print("[bold red]Invalid selection.[/bold red]")
 
     def _handle_api_config(self):
-        """Allows user to manually configure the API endpoint, key, and models."""
         console.print(Panel("[bold magenta]API Configuration[/bold magenta]", style="magenta"))
-        
-        action = Prompt.ask(
-            "What would you like to update?", 
-            choices=["url", "key", "model", "back"], 
-            default="url"
-        )
-        
+        action = Prompt.ask("What would you like to update?", choices=["url", "key", "model", "back"], default="url")
         if action == "url":
             new_url = Prompt.ask("[bold cyan]Enter Base API URL (e.g. http://localhost:11434/v1)[/bold cyan]")
             self._save_config({"base_url": new_url})
@@ -178,36 +176,28 @@ class Nano:
             console.print(f"[bold green]Model {new_model} added to list![/bold green]")
 
     def _register_core_tools(self):
-        """Injects internal Nano capabilities as tools."""
         def spawn_sub_agent(goal: str):
-            """
-            Spawns a specialized sub-agent to handle a complex, multi-step task that requires deep reasoning or a separate focus. 
-            DO NOT use this for simple tasks like listing files or reading a single file; use the direct tools for those.
-            Returns the final result of the sub-agent's work.
-            """
-            # Prevent sub-agents from spawning more sub-agents to stop infinite recursion
+            # Tool description is handled in generate_tool_schema based on docstring
+            # But here we just define the function
             if not hasattr(self, 'session') or self.session is None:
                 return "Error: Sub-agents cannot spawn further sub-agents to prevent recursive loops."
-
             sub = Nano(tools_dir=self.registry.tools_dir, model=self.model, is_subagent=True)
             sub.messages[0]["content"] = f"You are a Nano sub-agent. Your specific goal is: {goal}. Provide a final answer when complete."
             return sub.run(goal)
-
+        
+        # We'll attach the docstring manually here for generate_tool_schema to find
+        spawn_sub_agent.__doc__ = "Spawns a specialized sub-agent for complex multi-step tasks. DO NOT use for simple direct actions."
         self.registry.tools["spawn_sub_agent"] = spawn_sub_agent
-        self.registry.schemas.append(generate_tool_schema(spawn_sub_agent))
+        self.registry.schemas.append(generate_tool_schema(spawn_sub_agent, priority=3))
 
     def run(self, user_input: str):
-        # Slash Command Handling
         if user_input.strip() == "/model":
             self._handle_model_selection()
             return "Model selection complete."
-        
         if user_input.strip() == "/config":
             self._handle_api_config()
             return "Configuration updated."
-
         self.messages.append({"role": "user", "content": user_input})
-        
         while True:
             stream = self.client.chat.completions.create(
                 model=self.model,
@@ -216,16 +206,13 @@ class Nano:
                 tool_choice="auto",
                 stream=True
             )
-
             full_content = ""
             tool_calls = []
-            
             for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta.content:
                     full_content += delta.content
                     console.print(delta.content, end="")
-                
                 if delta.tool_calls:
                     for tc_delta in delta.tool_calls:
                         if tc_delta.index is None: continue
@@ -235,22 +222,18 @@ class Nano:
                         if tc_delta.id: tc["id"] = tc_delta.id
                         if tc_delta.function.name: tc["function"]["name"] += tc_delta.function.name
                         if tc_delta.function.arguments: tc["function"]["arguments"] += tc_delta.function.arguments
-
             if full_content:
                 console.print()
-
             msg_obj = {"role": "assistant", "content": full_content or None}
             if tool_calls:
                 msg_obj["tool_calls"] = tool_calls
             self.messages.append(msg_obj)
-
             if tool_calls:
                 for tc in tool_calls:
                     name = tc["function"]["name"]
                     args = json.loads(tc["function"]["arguments"])
                     schema = next((s for s in self.registry.schemas if s["function"]["name"] == name), {})
                     is_unsafe = schema.get("unsafe", False)
-                    
                     if is_unsafe and self.confirm_callback:
                         if not self.confirm_callback(name, args):
                             console.print(Panel(Text("User denied execution.", style="red"), title="Action Cancelled"))
@@ -259,9 +242,7 @@ class Nano:
                             result = self._execute_tool(name, args)
                     else:
                         result = self._execute_tool(name, args)
-                    
                     self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": result})
-                
                 if self.session:
                     self.session.save_session(self.messages)
                 continue 
