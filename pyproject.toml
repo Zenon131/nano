@@ -13,4 +13,4 @@ dependencies = [
 ]
 
 [project.scripts]
-nanocode = "nano_agent.cli:main"
+nanoc = "nano_agent.cli:main"
