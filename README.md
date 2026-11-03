@@ -1,91 +1,108 @@
-# 🌌 Nano
+# 🌌 nanoc
 **The Transparent Shell Agent.**
 
-Nano is a minimalist, open-source AI agent harness that lives in your terminal. Unlike "black box" agents, Nano is completely transparent: you see every thought, every tool call, and every result in real-time.
+`nanoc` is a minimalist, high-agency AI agent harness designed for developers who demand total transparency. Unlike "black box" agents, `nanoc` treats the terminal as a first-class interface, streaming every thought, tool call, and result in real-time.
 
-## 🚀 Quick Start (2 Minutes)
+---
+
+## 🚀 Quick Start
 
 ### 1. Install
 Clone the repo and install as an editable package:
 ```bash
-git clone https://github.com/yourusername/nano.git
+git clone https://github.com/Zenon131/nano.git
 cd nano
 pip install -e .
 ```
 
 ### 2. Configure
-Create a `.env` file in the root directory:
+Create a `.env` file in the root directory or set your environment variables:
 ```bash
 OPENAI_API_KEY=your_api_key_here
 ```
 
 ### 3. Run
-Since you installed it as a package, you can now run Nano from **anywhere**:
+Launch the agent from anywhere in your terminal:
 ```bash
-nano
+nanoc --new
 ```
 
 ---
 
-## 🧠 Model & Provider Management
+## 🧠 Core Philosophy
 
-Nano is provider-agnostic. It works with OpenAI, any OpenAI-compatible API, and local models via Ollama.
+`nanoc` is built on three pillars of agentic design:
+
+### 1. Total Transparency
+No hidden loops. Every interaction is rendered using `rich` panels:
+- **Cyan Panels**: Tool calls and arguments.
+- **Green Panels**: Tool outputs and results.
+- **Telemetry**: Toggle the `/debug` window to see the raw JSON payloads being sent to the LLM.
+
+### 2. Zero-Config Extensibility (Folder-as-Plugin)
+Adding capabilities to `nanoc` requires no registration or boilerplate.
+- **The Rule**: Any Python function placed in the `tools/` directory is automatically discovered via reflection.
+- **Requirements**: Provide **type hints** and a **docstring**. The docstring becomes the tool's description in the LLM's system prompt.
+
+**Example (`tools/github.py`):**
+```python
+def create_issue(title: str, body: str):
+    \"\"\"Creates a new issue on the current GitHub repository.\"\"\"
+    # Implementation here...
+    return "Issue #123 created successfully."
+```
+
+### 3. Recursive Agency
+`nanoc` can delegate. When faced with a complex, multi-step problem, the agent can use the `spawn_sub_agent` tool to create a specialized, isolated instance of itself. This prevents "context drift" and allows for parallel reasoning.
+
+---
+
+## 🛠️ Advanced Usage
 
 ### ⚡ Slash Commands
-While chatting, use these commands to change your agent's brain:
+Manage your agent's state without leaving the chat:
 
-*   `/model`: Opens a visual selector. It automatically discovers your local Ollama models and lists your configured custom models.
-*   `/config`: Opens the configuration menu to update your **Base API URL**, **API Key**, or add **Manual Models**.
+| Command | Description |
+| :--- | :--- |
+| `/help` | Show this list of available commands |
+| `/model` | Switch AI models (Auto-discovers local Ollama models) |
+| `/config` | Update API Base URL, Keys, or add Custom Models |
+| `/save <name>` | Archive the current conversation as a named session |
+| `/sessions` | List and teleport between past archived sessions |
+| `/context` | View all context imported from other agents (Hermes, OpenCode, etc.) |
+| `/debug` | Toggle the "Tool Calls & Telemetry" detail panel |
 
-### 🏠 Local Models (Ollama)
-To run Nano 100% locally, ensure Ollama is running and use `/model` to select a local model. Nano will automatically configure the endpoint to `http://localhost:11434/v1`.
+### 📁 Session & Context Hub
+`nanoc` acts as a central hub for your AI history:
+- **Session Library**: All conversations are stored in `~/.nano/sessions/`. You can switch between them instantly using `/sessions`.
+- **Smart Import**: On startup, `nanoc` scans your system for history files from other agents (Hermes, OpenCode, OpenClaw). If it finds a compatible chat log, it imports it into the current session's context automatically.
 
-### 📁 Project-Specific Context
-Drop a `.nano.json` into any project folder. Nano will automatically detect it and adopt the project's personality, model, and toolset.
+### 🛡️ Safety Gates
+Tools can be marked as `unsafe = True` in their schema. When an unsafe tool (like `run_command` or `write_file`) is called, `nanoc` pauses execution and requires a manual **Y/N** confirmation from the user.
 
 ---
 
-## 🛠️ Capabilities & Extensibility
+## ⚙️ Optimal Setup
 
-### 🔋 Built-in Powers
-Out of the box, Nano can:
-*   **Explore**: List directories and read files.
-*   **Manipulate**: Create new files (`write_file`) and surgically edit existing ones (`edit_file`).
-*   **Execute**: Run shell commands via `run_command`.
-*   **Delegate**: Spawn specialized sub-agents for complex, multi-step reasoning.
+### Local-First (Ollama)
+To run `nanoc` 100% locally:
+1. Start Ollama.
+2. Run `nanoc`.
+3. Use `/model` to select your local model. `nanoc` will automatically route requests to `http://localhost:11434/v1`.
 
-### 🔌 Adding Your Own Tools
-Nano's extensibility is "zero-config." To give Nano a new power:
-1. Create a `.py` file in the `tools/` directory.
-2. Write a Python function with **type hints** and a **docstring**.
-3. Restart Nano.
-
-**Example (`tools/weather.py`):**
-```python
-def get_weather(city: str):
-    \"\"\"Fetches the current weather for a given city.\"\"\"
-    # Your API call here
-    return f\"The weather in {city} is sunny and 75°F.\"
+### Project-Specific Personality
+Drop a `.nano.json` file into any project folder to define a project-specific brain:
+```json
+{
+  "model": "gpt-4o",
+  "system_prompt": "You are an expert Rust engineer specializing in async runtimes.",
+  "tools_dir": "./custom_tools"
+}
 ```
+When launched from that directory, `nanoc` adopts these settings automatically.
 
 ---
 
-## 🛡️ Safety & Transparency
-*   **Transparent Execution**: Every tool call is rendered in a distinct cyan panel; every result in a green panel.
-*   **Safety Gates**: Any tool marked as `unsafe` (like `run_command`, `write_file`, or `edit_file`) will trigger a manual confirmation prompt before execution.
-*   **Recursive Intelligence**: Nano can spawn \"sub-agents\" to handle complex sub-tasks independently.
-*   **Session Memory**: Conversations are persisted in `.nano_history` so you can pick up where you left off.
-
-## ⌨️ Commands
-*   `exit` / `quit`: Stop the agent.
-*   `/model`: Change the active AI model.
-*   `/config`: Update API keys and endpoints.
-*   `nano --new`: Start a fresh session (wipes history).
-
----
-
-## 💡 Pro-Tip
-If you didn't use `pip install -e .`, you can still run Nano by adding this alias to your `.zshrc` or `.bashrc`:
-```bash
-alias nano='export PYTHONPATH=$PYTHONPATH:/absolute/path/to/nano && python3 -m nano_agent.cli'
-```
+## ⌨️ CLI Options
+- `nanoc`: Starts the agent with the last saved session.
+- `nanoc --new`: Wipes the current session and starts fresh.
