@@ -10,16 +10,16 @@ console = Console()
 
 def confirm_tool_call(name, args):
     """Callback used by Nano to request permission for unsafe tools."""
-    console.print(f"\\n[bold yellow]⚠️  Safety Warning:[/bold yellow] Nano wants to run [bold red]{name}[/bold red] with args: {args}")
+    console.print(f"\n[bold yellow]⚠️  Safety Warning:[/bold yellow] Nano wants to run [bold red]{name}[/bold red] with args: {args}")
     return Confirm.ask("Allow this execution?")
 
-async def main():
+async def run_nano():
     parser = argparse.ArgumentParser(description="Nano - The Transparent Shell Agent")
     parser.add_argument("--new", action="store_true", help="Start a fresh session")
     args = parser.parse_args()
 
     console.print("[bold magenta]Nano[/bold magenta] - The Transparent Shell Agent")
-    console.print("Type 'exit' or 'quit' to stop.\\n")
+    console.print("Type 'exit' or 'quit' to stop.\n")
     
     # Let the Nano core handle the default tools directory resolution
     tools_dir = None
@@ -52,12 +52,22 @@ async def main():
             response = await agent.run(user_input)
             
             # The streamed content is already printed by the agent
-            console.print(f"\\n") 
+            console.print(f"\n") 
             
         except KeyboardInterrupt:
             break
         except Exception as e:
-            console.print(f"\\n[bold red]Runtime Error:[/bold red] {e}\\n")
+            console.print(f"\n[bold red]Runtime Error:[/bold red] {e}\n")
+
+def main():
+    """
+    Synchronous entry point for the CLI.
+    This is what the pyproject.toml entry point calls.
+    """
+    try:
+        asyncio.run(run_nano())
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

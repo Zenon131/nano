@@ -3,7 +3,7 @@ import json
 import requests
 import asyncio
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Callable, Union
+from typing import List, Dict, Any, Optional, Callable, Union, Tuple
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
@@ -19,17 +19,29 @@ console = Console()
 class ContextImporter:
     """Discovers and imports history from other AI agent frameworks."""
     
-    # Known history patterns: {agent_name: (path_pattern, schema_type)}
+    # Known high-confidence signatures: {agent_name: (path_pattern, schema_type)}
     SIGNATURES = {
         "Hermes": ("~/.hermes/profiles/personal/.nano_history", "openai"),
         "OpenCode": ("~/.opencode/history.json", "generic"),
         "OpenClaw": ("~/.openclaw/sessions", "generic"),
     }
 
+    # Directories to scan for generalized history search
+    SEARCH_DIRS = [
+        Path("~/.config").expanduser(),
+        Path("~/.local/share").expanduser(),
+        Path("~/Library/Application Support").expanduser(),
+        Path("~").expanduser(),
+    ]
+
+    # File patterns that typically indicate agent history
+    FILE_PATTERNS = ["*history*.json", "*session*.json", ".nano_history", "history.json"]
+
     @staticmethod
     def normalize(messages: List[Dict], schema: str) -> List[Dict]:
         normalized = []
         for m in messages:
+            if not isinstance(m, dict): continue
             if schema == "openai":
                 normalized.append(m)
             elif schema == "generic":
@@ -38,8 +50,51 @@ class ContextImporter:
                 normalized.append({"role": role, "content": content})
         return normalized
 
-    def discover_and_import(self) -> List[Dict]:
+    def _is_chat_history(self, data: Any) -> bool:
+        """Heuristic to determine if a JSON object is likely a chat history."""
+        if not isinstance(data, list) or not data:
+            return False
+        
+        # Check first few entries for chat-like keys
+        sample = data[0] if isinstance(data[0], dict) else {}
+        required_keys = {"role", "content"}
+        found_keys = {k for k in sample.keys() if k in required_keys}
+        
+        # If it has role and content, it's likely history
+        return len(found_keys) >= 1 # Even one is a strong signal if it's a list of dicts
+
+    def _generalized_search(self) -> List[Tuple[str, Dict]]:
+        discovered = []
+        for directory in self.SEARCH_DIRS:
+            if not directory.exists():
+                continue
+            
+            try:
+                # Use rglob to find patterns recursively but limit depth to avoid hanging
+                for pattern in self.FILE_PATTERNS:
+                    for path in directory.glob(pattern):
+                        # Skip very large files to prevent memory issues
+                        if path.stat().st_size > 10 * 1024 * 1024: continue
+                        
+                        try:
+                            with open(path, "r") as f:
+                                data = json.load(f)
+                                if self._is_chat_history(data):
+                                    # Label by the filename or parent folder
+                                    source_name = f"Auto({path.name})"
+                                    normalized = self.normalize(data, "generic")
+                                    for msg in normalized:
+                                        discovered.append((source_name, msg))
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        return discovered
+
+    def discover_and_import(self) -> List[Tuple[str, Dict]]:
         imported_messages = []
+        
+        # 1. Check known signatures first (high confidence)
         for agent, (pattern, schema) in self.SIGNATURES.items():
             path = Path(pattern).expanduser()
             if path.exists():
@@ -48,31 +103,63 @@ class ContextImporter:
                         data = json.load(f)
                         if isinstance(data, list):
                             normalized = self.normalize(data, schema)
-                            imported_messages.extend(normalized)
+                            for msg in normalized:
+                                imported_messages.append((agent, msg))
                 except Exception:
                     continue
+        
+        # 2. Run generalized search for unknown agents
+        imported_messages.extend(self._generalized_search())
+        
         return imported_messages
 
 class SessionManager:
-    def __init__(self, history_file: str = ".nano_history"):
-        self.path = Path(history_file)
+    def __init__(self, sessions_dir: str = "~/.nano/sessions"):
+        self.path = Path(sessions_dir).expanduser()
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.current_session_file = self.path / "current.json"
 
-    def save_session(self, messages: List[Dict[str, Any]]):
-        with open(self.path, "w") as f:
+    def save_session(self, messages: List[Dict[str, Any]], session_id: Optional[str] = None):
+        # Always save to the current session pointer
+        with open(self.current_session_file, "w") as f:
             json.dump(messages, f, indent=2)
+        
+        # If a specific ID is provided (or we want to archive), save to a timestamped file
+        if session_id:
+            target = self.path / f"{session_id}.json"
+            with open(target, "w") as f:
+                json.dump(messages, f, indent=2)
 
-    def load_session(self) -> List[Dict[str, Any]]:
-        if not self.path.exists():
+    def load_session(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        target = self.path / f"{session_id}.json" if session_id else self.current_session_file
+        if not target.exists():
             return []
         try:
-            with open(self.path, "r") as f:
+            with open(target, "r") as f:
                 return json.load(f)
         except Exception:
             return []
 
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        sessions = []
+        for f in self.path.glob("*.json"):
+            if f.name == "current.json": continue
+            try:
+                # Use file mtime as a proxy for session date
+                mtime = f.stat().st_mtime
+                sessions.append({
+                    "id": f.stem, 
+                    "date": mtime, 
+                    "path": str(f)
+                })
+            except Exception:
+                continue
+        # Sort by newest first
+        return sorted(sessions, key=lambda x: x["date"], reverse=True)
+
     def clear_session(self):
-        if self.path.exists():
-            self.path.unlink()
+        if self.current_session_file.exists():
+            self.current_session_file.unlink()
 
 class Nano:
     def __init__(self, tools_dir: Optional[str] = None, model: str = "gpt-4o", 
@@ -127,8 +214,10 @@ class Nano:
         self.session = SessionManager()
         
         importer = ContextImporter()
-        foreign_context = importer.discover_and_import()
+        foreign_context_tuples = importer.discover_and_import()
+        foreign_context = [msg for agent, msg in foreign_context_tuples]
         
+        self.imported_context = foreign_context_tuples
         self.messages = self.session.load_session()
         self.confirm_callback = confirm_callback
         
@@ -260,13 +349,81 @@ class Nano:
         self.registry.schemas.append(generate_tool_schema(ask_user, priority=1))
 
     async def run(self, user_input: str):
-        if user_input.strip() == "/model":
+        user_input_strip = user_input.strip()
+        if user_input_strip == "/help":
+            help_table = Table(title="Nano Slash Commands", expand=True, border_style="magenta")
+            help_table.add_column("Command", style="cyan", no_wrap=True)
+            help_table.add_column("Description", style="white")
+            help_table.add_row("/help", "Show this list of available slash commands")
+            help_table.add_row("/sessions", "List and switch between past sessions")
+            help_table.add_row("/context", "View context imported from other agents")
+            help_table.add_row("/model", "Select or switch the active AI model")
+            help_table.add_row("/config", "Configure API base URL and API key")
+            help_table.add_row("/debug", "Toggle the 'Tool Calls & Telemetry' window")
+            console.print(Panel(help_table, border_style="magenta"))
+            return "Help menu displayed."
+        if user_input_strip == "/sessions":
+            if self.session is None:
+                console.print("[bold red]Session manager not available (sub-agent mode).[/bold red]")
+                return "Session management is disabled for sub-agents."
+            
+            sessions = self.session.list_sessions()
+            if not sessions:
+                console.print("[dim]No archived sessions found.[/dim]")
+                return "No archived sessions."
+            
+            sess_table = Table(title="Past Sessions", expand=True, border_style="magenta")
+            sess_table.add_column("ID", style="cyan", no_wrap=True)
+            sess_table.add_column("Date", style="dim")
+            
+            for s in sessions:
+                from datetime import datetime
+                date_str = datetime.fromtimestamp(s["date"]).strftime("%Y-%m-%d %H:%M")
+                sess_table.add_row(s["id"], date_str)
+            
+            console.print(Panel(sess_table, border_style="magenta"))
+            choice = Prompt.ask("\n[bold magenta]Enter Session ID to load (or press Enter to cancel)[/bold magenta]")
+            
+            if choice:
+                # Save current state before switching
+                self.session.save_session(self.messages, session_id=f"backup_{int(asyncio.get_event_loop().time())}")
+                
+                new_messages = self.session.load_session(session_id=choice)
+                if new_messages:
+                    self.messages = new_messages
+                    # Ensure system prompt is preserved
+                    self.messages[0] = {"role": "system", "content": self.system_prompt}
+                    console.print(f"[bold green]✓ Loaded session {choice}[/bold green]")
+                    return f"Switched to session {choice}."
+                else:
+                    console.print("[bold red]Failed to load session.[/bold red]")
+                    return "Session load failed."
+            return "Session switch cancelled."
+        if user_input_strip == "/context":
+            if not self.imported_context:
+                console.print("[dim]No imported context found.[/dim]")
+                return "No imported context."
+            
+            ctx_table = Table(title="Imported Context", expand=True, border_style="magenta")
+            ctx_table.add_column("Source", style="cyan", width=12)
+            ctx_table.add_column("Role", style="magenta", width=10)
+            ctx_table.add_column("Content", style="white")
+            
+            for source, msg in self.imported_context:
+                content = msg.get("content", "")
+                # Truncate long messages for the table
+                display_content = (content[:100] + "...") if len(content) > 100 else content
+                ctx_table.add_row(source, msg.get("role", "unknown"), display_content)
+            
+            console.print(Panel(ctx_table, border_style="magenta"))
+            return f"Displayed {len(self.imported_context)} imported messages."
+        if user_input_strip == "/model":
             self._handle_model_selection()
             return "Model selection complete."
-        if user_input.strip() == "/config":
+        if user_input_strip == "/config":
             self._handle_api_config()
             return "Configuration updated."
-        if user_input.strip() == "/debug":
+        if user_input_strip == "/debug":
             self.debug_enabled = not self.debug_enabled
             status = "enabled" if self.debug_enabled else "disabled"
             return f"Debug telemetry {status}."
