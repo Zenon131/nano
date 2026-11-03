@@ -1,7 +1,8 @@
 import inspect
 import importlib.util
+import asyncio
 from pathlib import Path
-from typing import get_type_hints, Any, Callable, Dict
+from typing import get_type_hints, Any, Callable, Dict, Union
 
 def generate_tool_schema(func: Callable, priority: int = 1) -> Dict[str, Any]:
     """
@@ -59,7 +60,6 @@ class ToolRegistry:
     def load_tools(self):
         """Dynamically loads Python functions from the tools directory."""
         if not self.tools_dir.exists() or not self.tools_dir.is_dir():
-            # We throw a hard error here because Nano cannot function without its tools
             raise FileNotFoundError(f"CRITICAL: Tools directory not found at {self.tools_dir}")
 
         files = list(self.tools_dir.glob("*.py"))
@@ -76,14 +76,19 @@ class ToolRegistry:
             for name, obj in inspect.getmembers(module, inspect.isfunction):
                 if obj.__module__ == module.__name__:
                     self.tools[name] = obj
-                    # Default tools are priority 1 (Basic)
                     self.schemas.append(generate_tool_schema(obj, priority=1))
 
-    def execute(self, name: str, args: dict) -> str:
+    async def execute(self, name: str, args: dict) -> str:
         if name not in self.tools:
             return f"Error: Tool {name} not found."
+        
+        func = self.tools[name]
         try:
-            result = self.tools[name](**args)
+            if inspect.iscoroutinefunction(func):
+                result = await func(**args)
+            else:
+                # Run sync functions in a thread to avoid blocking the event loop
+                result = await asyncio.to_thread(func, **args)
             return str(result)
         except Exception as e:
             return f"Error executing {name}: {str(e)}"

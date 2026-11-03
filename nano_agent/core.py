@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 from openai import OpenAI
@@ -14,7 +15,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 console = Console()
-
 
 class SessionManager:
     def __init__(self, history_file: str = ".nano_history"):
@@ -42,11 +42,9 @@ class Nano:
                  confirm_callback: Optional[Callable[[str, Dict], bool]] = None,
                  is_subagent: bool = False):
         
-        # 1. Project Config Load
         config = self._load_config()
         self.model = config.get("model", model)
         
-        # ULTIMATE SYSTEM PROMPT: No more "suggestions", only " identities".
         project_prompt = config.get("system_prompt", "You are Nano, a transparent terminal AI agent.")
         
         self.system_prompt = (
@@ -68,18 +66,14 @@ class Nano:
             base_url=self.base_url
         )
         
-        # ALWAYS define package_root relative to this file for absolute resolution
         package_root = Path(__file__).parent.parent
-        
         if tools_dir is None:
             tools_dir = str(package_root / "tools")
         
-        # Resolve tools_dir from config or default
         config_tools_dir = config.get("tools_dir")
         if config_tools_dir:
             config_path = Path(config_tools_dir)
             if not config_path.is_absolute():
-                # If relative, resolve relative to the package root, not CWD
                 final_tools_dir = str(package_root / config_path)
             else:
                 final_tools_dir = config_tools_dir
@@ -90,7 +84,6 @@ class Nano:
         self.registry.load_tools()
         self._register_core_tools()
         
-        # Sort tools by priority
         self.registry.schemas.sort(key=lambda x: x.get("priority", 1))
         
         self.debug_enabled = False
@@ -202,18 +195,26 @@ class Nano:
             console.print(f"[bold green]Model {new_model} added to list![/bold green]")
 
     def _register_core_tools(self):
-        def spawn_sub_agent(goal: str):
+        async def spawn_sub_agent(goal: str):
             if not hasattr(self, 'session') or self.session is None:
                 return "Error: Sub-agents cannot spawn further sub-agents to prevent recursive loops."
             sub = Nano(tools_dir=self.registry.tools_dir, model=self.model, is_subagent=True)
             sub.messages[0]["content"] = f"You are a Nano sub-agent. Your specific goal is: {goal}. Provide a final answer when complete."
-            return sub.run(goal)
+            return await sub.run(goal)
         
         spawn_sub_agent.__doc__ = "Spawns a specialized sub-agent for complex multi-step tasks. DO NOT use for simple direct actions."
         self.registry.tools["spawn_sub_agent"] = spawn_sub_agent
         self.registry.schemas.append(generate_tool_schema(spawn_sub_agent, priority=3))
 
-    def run(self, user_input: str):
+        async def ask_user(question: str):
+            console.print(Panel(Text(f"Agent is asking: {question}", style="bold yellow"), title="User Query"))
+            return Prompt.ask("[bold blue]Your Answer[/bold blue]")
+        
+        ask_user.__doc__ = "Use this tool to ask the user for clarification, missing information, or a decision."
+        self.registry.tools["ask_user"] = ask_user
+        self.registry.schemas.append(generate_tool_schema(ask_user, priority=1))
+
+    async def run(self, user_input: str):
         if user_input.strip() == "/model":
             self._handle_model_selection()
             return "Model selection complete."
@@ -264,20 +265,16 @@ class Nano:
                 msg_obj["tool_calls"] = tool_calls
             self.messages.append(msg_obj)
             if tool_calls:
+                # PARALLEL TOOL EXECUTION
+                tasks = []
                 for tc in tool_calls:
-                    name = tc["function"]["name"]
-                    args = json.loads(tc["function"]["arguments"])
-                    schema = next((s for s in self.registry.schemas if s["function"]["name"] == name), {})
-                    is_unsafe = schema.get("unsafe", False)
-                    if is_unsafe and self.confirm_callback:
-                        if not self.confirm_callback(name, args):
-                            console.print(Panel(Text("User denied execution.", style="red"), title="Action Cancelled"))
-                            result = "Error: User denied execution of this tool."
-                        else:
-                            result = self._execute_tool(name, args)
-                    else:
-                        result = self._execute_tool(name, args)
-                    self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": result})
+                    tasks.append(self._execute_tool_wrapper(tc))
+                
+                tool_results = await asyncio.gather(*tasks)
+                
+                for tc, result in zip(tool_calls, tool_results):
+                    self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": tc["function"]["name"], "content": result})
+                
                 if self.session:
                     self.session.save_session(self.messages)
                 continue 
@@ -286,8 +283,26 @@ class Nano:
                     self.session.save_session(self.messages)
                 return full_content
 
-    def _execute_tool(self, name: str, args: dict) -> str:
+    async def _execute_tool_wrapper(self, tc: Dict[str, Any]) -> str:
+        name = tc["function"]["name"]
+        args_str = tc["function"]["arguments"]
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            args = {}
+            
+        schema = next((s for s in self.registry.schemas if s["function"]["name"] == name), {})
+        is_unsafe = schema.get("unsafe", False)
+        
+        if is_unsafe and self.confirm_callback:
+            if not self.confirm_callback(name, args):
+                console.print(Panel(Text("User denied execution.", style="red"), title="Action Cancelled"))
+                return "Error: User denied execution of this tool."
+        
+        return await self._execute_tool(name, args)
+
+    async def _execute_tool(self, name: str, args: dict) -> str:
         console.print(Panel(Text(f"[bold cyan]Tool Call:[/bold cyan] {name}({args})", style="cyan"), title="Executing Tool"))
-        result = self.registry.execute(name, args)
+        result = await self.registry.execute(name, args)
         console.print(Panel(Text(result, style="green"), title="Tool Result"))
         return result

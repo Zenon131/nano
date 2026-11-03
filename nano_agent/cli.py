@@ -1,6 +1,7 @@
 import sys
 import os
 import argparse
+import asyncio
 from rich.console import Console
 from rich.prompt import Prompt, Confirm
 from nano_agent.core import Nano
@@ -9,16 +10,16 @@ console = Console()
 
 def confirm_tool_call(name, args):
     """Callback used by Nano to request permission for unsafe tools."""
-    console.print(f"\n[bold yellow]⚠️  Safety Warning:[/bold yellow] Nano wants to run [bold red]{name}[/bold red] with args: {args}")
+    console.print(f"\\n[bold yellow]⚠️  Safety Warning:[/bold yellow] Nano wants to run [bold red]{name}[/bold red] with args: {args}")
     return Confirm.ask("Allow this execution?")
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Nano - The Transparent Shell Agent")
     parser.add_argument("--new", action="store_true", help="Start a fresh session")
     args = parser.parse_args()
 
     console.print("[bold magenta]Nano[/bold magenta] - The Transparent Shell Agent")
-    console.print("Type 'exit' or 'quit' to stop.\n")
+    console.print("Type 'exit' or 'quit' to stop.\\n")
     
     # Let the Nano core handle the default tools directory resolution
     tools_dir = None
@@ -48,15 +49,15 @@ def main():
                 continue
 
             # streaming response is handled inside agent.run
-            response = agent.run(user_input)
+            response = await agent.run(user_input)
             
             # The streamed content is already printed by the agent
-            console.print(f"\n") 
+            console.print(f"\\n") 
             
         except KeyboardInterrupt:
             break
         except Exception as e:
-            console.print(f"\n[bold red]Runtime Error:[/bold red] {e}\n")
+            console.print(f"\\n[bold red]Runtime Error:[/bold red] {e}\\n")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
