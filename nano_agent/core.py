@@ -3,7 +3,7 @@ import json
 import requests
 import asyncio
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Union
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
@@ -15,6 +15,43 @@ from dotenv import load_dotenv
 
 load_dotenv()
 console = Console()
+
+class ContextImporter:
+    """Discovers and imports history from other AI agent frameworks."""
+    
+    # Known history patterns: {agent_name: (path_pattern, schema_type)}
+    SIGNATURES = {
+        "Hermes": ("~/.hermes/profiles/personal/.nano_history", "openai"),
+        "OpenCode": ("~/.opencode/history.json", "generic"),
+        "OpenClaw": ("~/.openclaw/sessions", "generic"),
+    }
+
+    @staticmethod
+    def normalize(messages: List[Dict], schema: str) -> List[Dict]:
+        normalized = []
+        for m in messages:
+            if schema == "openai":
+                normalized.append(m)
+            elif schema == "generic":
+                role = m.get("role") or ("user" if "user" in m else "assistant")
+                content = m.get("content") or m.get("text") or str(m)
+                normalized.append({"role": role, "content": content})
+        return normalized
+
+    def discover_and_import(self) -> List[Dict]:
+        imported_messages = []
+        for agent, (pattern, schema) in self.SIGNATURES.items():
+            path = Path(pattern).expanduser()
+            if path.exists():
+                try:
+                    with open(path, "r") as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            normalized = self.normalize(data, schema)
+                            imported_messages.extend(normalized)
+                except Exception:
+                    continue
+        return imported_messages
 
 class SessionManager:
     def __init__(self, history_file: str = ".nano_history"):
@@ -88,9 +125,17 @@ class Nano:
         
         self.debug_enabled = False
         self.session = SessionManager()
+        
+        importer = ContextImporter()
+        foreign_context = importer.discover_and_import()
+        
         self.messages = self.session.load_session()
         self.confirm_callback = confirm_callback
         
+        if not self.messages and foreign_context:
+            console.print(Panel(Text(f"Imported context from other agents ({len(foreign_context)} messages).", style="dim"), title="Context Import"))
+            self.messages = foreign_context
+
         if self.messages:
             self.messages[0] = {"role": "system", "content": self.system_prompt}
         else:
@@ -235,9 +280,10 @@ class Nano:
                     "tools": self.registry.schemas
                 }, indent=2), style="dim"), title="Tool Calls & Telemetry"))
 
+            # Use a type-cast for messages to satisfy the OpenAI SDK's strict type checking
             stream = self.client.chat.completions.create(
                 model=self.model,
-                messages=self.messages,
+                messages=self.messages, # type: ignore
                 tools=self.registry.schemas,
                 tool_choice="auto",
                 stream=True
@@ -265,7 +311,6 @@ class Nano:
                 msg_obj["tool_calls"] = tool_calls
             self.messages.append(msg_obj)
             if tool_calls:
-                # PARALLEL TOOL EXECUTION
                 tasks = []
                 for tc in tool_calls:
                     tasks.append(self._execute_tool_wrapper(tc))
