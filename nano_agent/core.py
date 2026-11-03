@@ -15,8 +15,6 @@ from dotenv import load_dotenv
 load_dotenv()
 console = Console()
 
-# SET TO True to see exactly what is sent to the LLM
-DEBUG = True
 
 class SessionManager:
     def __init__(self, history_file: str = ".nano_history"):
@@ -95,6 +93,7 @@ class Nano:
         # Sort tools by priority
         self.registry.schemas.sort(key=lambda x: x.get("priority", 1))
         
+        self.debug_enabled = False
         self.session = SessionManager()
         self.messages = self.session.load_session()
         self.confirm_callback = confirm_callback
@@ -221,15 +220,19 @@ class Nano:
         if user_input.strip() == "/config":
             self._handle_api_config()
             return "Configuration updated."
+        if user_input.strip() == "/debug":
+            self.debug_enabled = not self.debug_enabled
+            status = "enabled" if self.debug_enabled else "disabled"
+            return f"Debug telemetry {status}."
         self.messages.append({"role": "user", "content": user_input})
         
         while True:
-            if DEBUG:
+            if self.debug_enabled:
                 console.print(Panel(Text(json.dumps({
                     "model": self.model,
                     "messages": self.messages,
                     "tools": self.registry.schemas
-                }, indent=2), style="dim"), title="DEBUG: API Request"))
+                }, indent=2), style="dim"), title="Tool Calls & Telemetry"))
 
             stream = self.client.chat.completions.create(
                 model=self.model,
