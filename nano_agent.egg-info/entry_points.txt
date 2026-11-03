@@ -1,2 +1,2 @@
 [console_scripts]
-nanoc = nano_agent.cli:main
+nanocode = nano_agent.cli:main
