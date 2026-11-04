@@ -21,7 +21,7 @@ class ContextImporter:
     
     # Known high-confidence signatures: {agent_name: (path_pattern, schema_type)}
     SIGNATURES = {
-        "Hermes": ("~/.hermes/profiles/personal/.nano_history", "openai"),
+        "Hermes": ("~/.hermes/**/*.json", "openai"), # Use glob for profiles
         "OpenCode": ("~/.opencode/history.json", "generic"),
         "OpenClaw": ("~/.openclaw/sessions", "generic"),
     }
@@ -35,7 +35,7 @@ class ContextImporter:
     ]
 
     # File patterns that typically indicate agent history
-    FILE_PATTERNS = ["*history*.json", "*session*.json", ".nano_history", "history.json"]
+    FILE_PATTERNS = ["*history*.json", "*session*.json", ".nano_history", "history.json", "chat_*.json"]
 
     @staticmethod
     def normalize(messages: List[Dict], schema: str) -> List[Dict]:
@@ -55,13 +55,17 @@ class ContextImporter:
         if not isinstance(data, list) or not data:
             return False
         
-        # Check first few entries for chat-like keys
-        sample = data[0] if isinstance(data[0], dict) else {}
-        required_keys = {"role", "content"}
-        found_keys = {k for k in sample.keys() if k in required_keys}
+        # Chat-like keys to look for
+        chat_keys = {"role", "content", "text", "message", "prompt", "response", "user", "assistant"}
         
-        # If it has role and content, it's likely history
-        return len(found_keys) >= 1 # Even one is a strong signal if it's a list of dicts
+        # Sample first few entries
+        found_keys = set()
+        for entry in data[:5]:
+            if isinstance(entry, dict):
+                found_keys.update(entry.keys())
+        
+        # If it contains at least a few of the common chat keys, it's a candidate
+        return len(found_keys.intersection(chat_keys)) >= 1
 
     def _generalized_search(self) -> List[Tuple[str, Dict]]:
         discovered = []
@@ -96,17 +100,31 @@ class ContextImporter:
         
         # 1. Check known signatures first (high confidence)
         for agent, (pattern, schema) in self.SIGNATURES.items():
-            path = Path(pattern).expanduser()
-            if path.exists():
-                try:
-                    with open(path, "r") as f:
-                        data = json.load(f)
-                        if isinstance(data, list):
-                            normalized = self.normalize(data, schema)
-                            for msg in normalized:
-                                imported_messages.append((agent, msg))
-                except Exception:
-                    continue
+            # Handle glob patterns in signatures
+            if "*" in pattern:
+                paths = list(Path(pattern).expanduser().glob("**/*.json"))
+                for path in paths:
+                    try:
+                        with open(path, "r") as f:
+                            data = json.load(f)
+                            if isinstance(data, list):
+                                normalized = self.normalize(data, schema)
+                                for msg in normalized:
+                                    imported_messages.append((agent, msg))
+                    except Exception:
+                        continue
+            else:
+                path = Path(pattern).expanduser()
+                if path.exists():
+                    try:
+                        with open(path, "r") as f:
+                            data = json.load(f)
+                            if isinstance(data, list):
+                                normalized = self.normalize(data, schema)
+                                for msg in normalized:
+                                    imported_messages.append((agent, msg))
+                    except Exception:
+                        continue
         
         # 2. Run generalized search for unknown agents
         imported_messages.extend(self._generalized_search())
@@ -355,6 +373,7 @@ class Nano:
             help_table.add_column("Command", style="cyan", no_wrap=True)
             help_table.add_column("Description", style="white")
             help_table.add_row("/help", "Show this list of available slash commands")
+            help_table.add_row("/save <name>", "Archive current session with a name")
             help_table.add_row("/sessions", "List and switch between past sessions")
             help_table.add_row("/context", "View context imported from other agents")
             help_table.add_row("/model", "Select or switch the active AI model")
@@ -362,6 +381,19 @@ class Nano:
             help_table.add_row("/debug", "Toggle the 'Tool Calls & Telemetry' window")
             console.print(Panel(help_table, border_style="magenta"))
             return "Help menu displayed."
+        if user_input_strip.startswith("/save "):
+            name = user_input_strip[6:].strip()
+            if not name:
+                console.print("[bold red]Error: Please provide a session name. (e.g. /save project-x)[/bold red]")
+                return "Save failed: missing name."
+            
+            if self.session:
+                self.session.save_session(self.messages, session_id=name)
+                console.print(f"[bold green]✓ Session archived as {name}[/bold green]")
+                return f"Session saved as {name}."
+            else:
+                console.print("[bold red]Error: Session manager not available.[/bold red]")
+                return "Save failed."
         if user_input_strip == "/sessions":
             if self.session is None:
                 console.print("[bold red]Session manager not available (sub-agent mode).[/bold red]")

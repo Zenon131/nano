@@ -10,6 +10,7 @@ dependencies = [
     "openai",
     "rich",
     "python-dotenv",
+    "tavily-python",
 ]
 
 [project.scripts]
