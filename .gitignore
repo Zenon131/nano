@@ -6,3 +6,5 @@ __pycache__/
 *$py.class
 .DS_Store
 .nano.json
+.nano.json.lock
+.nano-config-*

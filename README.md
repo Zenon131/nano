@@ -16,11 +16,9 @@ pip install -e .
 ```
 
 ### 2. Configure
-Create a `.env` file in the root directory or set your environment variables:
-```bash
-OPENAI_API_KEY=your_api_key_here
-TAVILY_API_KEY=your_tavily_key_here
-```
+Set the environment variables needed by your provider before starting Nano. For example, OpenRouter uses `OPENROUTER_API_KEY`, OpenAI uses `OPENAI_API_KEY`, and Tavily web search optionally uses `TAVILY_API_KEY`. Do not share your keys or commit them to the repository.
+
+Nano also supports legacy `.nano.json` API keys, which are stored in plaintext; environment variables are recommended.
 
 ### 3. Run
 Launch the agent from anywhere in your terminal:
@@ -48,7 +46,7 @@ Adding capabilities to `nanoc` requires no registration or boilerplate.
 **Example (`tools/github.py`):**
 ```python
 def create_issue(title: str, body: str):
-    \"\"\"Creates a new issue on the current GitHub repository.\"\"\"
+    """Creates a new issue on the current GitHub repository."""
     # Implementation here...
     return "Issue #123 created successfully."
 ```
@@ -74,8 +72,9 @@ Manage your agent's state without leaving the chat:
 | Command | Description |
 | :--- | :--- |
 | `/help` | Show this list of available commands |
-| `/model` | Switch AI models (Auto-discovers local Ollama models) |
-| `/config` | Update API Base URL, Keys, or add Custom Models |
+| `/provider` or `/provider <name>` | Choose a provider; each retains its own endpoint, model and credential settings |
+| `/model` or `/model <model-id>` | Choose a model for the active provider; discovers installed Ollama models |
+| `/config` | Update the active provider's base URL, key environment-variable name, or model |
 | `/save <name>` | Archive the current conversation as a named session |
 | `/sessions` | List and teleport between past archived sessions |
 | `/context` | View all context imported from other agents (Hermes, OpenCode, etc.) |
@@ -87,17 +86,27 @@ Manage your agent's state without leaving the chat:
 - **Smart Import**: On startup, `nanoc` scans your system for history files from other agents (Hermes, OpenCode, OpenClaw). If it finds a compatible chat log, it imports it into the current session's context automatically.
 
 ### 🛡️ Safety Gates
-Tools can be marked as `unsafe = True` in their schema. When an unsafe tool (like `run_command` or `write_file`) is called, `nanoc` pauses execution and requires a manual **Y/N** confirmation from the user.
+Tools can be marked unsafe with `setattr(my_tool, "unsafe", True)` at module level, before Nano discovers them. Unsafe built-ins such as `run_command`, `write_file`, and `edit_file` require approval in the CLI; if no confirmation callback is available, Nano denies execution. Sub-agents inherit the parent agent's confirmation callback.
 
 ---
 
 ## ⚙️ Optimal Setup
 
-### Local-First (Ollama)
-To run `nanoc` 100% locally:
-1. Start Ollama.
-2. Run `nanoc`.
-3. Use `/model` to select your local model. `nanoc` will automatically route requests to `http://localhost:11434/v1`.
+### Choose a provider and model
+Nano has presets for **OpenRouter**, **OpenAI**, **Ollama** and a **custom** OpenAI-compatible API. Each provider keeps its own model and endpoint in `.nano.json` in the directory where you launch Nano; switching providers restores those settings. Existing single-provider settings are migrated when you first change a provider or model.
+
+When switching to a different endpoint, Nano asks for confirmation: subsequent requests can include the current conversation, system prompt, and tool results. Changing an endpoint also warns that the provider's API key may be sent to that address. Declining leaves your settings unchanged. Provider updates require `.nano.json` to be a regular file, not a symlink; Nano coordinates its own concurrent writers, but not unrelated programs editing that file.
+
+For OpenRouter, set `OPENROUTER_API_KEY` in your shell before launching `nanoc`, then enter these commands inside Nano:
+
+```text
+/provider openrouter
+/model google/gemma-4-31b-it
+```
+
+The exact model ID stays paired with OpenRouter's `https://openrouter.ai/api/v1` endpoint. Use `/provider ollama` to switch back to Ollama, and `/model` to select an installed Ollama model. Ollama may also offer cloud models; choose a local model if you need local-only inference.
+
+For another OpenAI-compatible endpoint, select `/provider custom`, use `/config` → `url` to set its base URL, and use `/config` → `key` to specify the **name** of an environment variable containing its API key (default `CUSTOM_API_KEY`). Set that variable before starting Nano, then enter `/model <exact-model-id>`. The `/provider` and `/model` commands also offer interactive menus when run without arguments.
 
 ### Project-Specific Personality
 Drop a `.nano.json` file into any project folder to define a project-specific brain:

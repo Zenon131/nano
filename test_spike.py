@@ -1,47 +1,51 @@
-from unittest.mock import MagicMock, patch
-from nano_agent.core import NanoAgent
+"""Regression test for tool discovery and Nano's streamed agent loop."""
+
+import asyncio
+import json
 import os
-import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-# Add project root to sys.path to allow importing nano_agent
-sys.path.append("/Users/jonathanwallace/Projects/nano-agent")
+from nano_agent.core import Nano
 
-def test_discovery_and_loop():
-    tools_dir = "/Users/jonathanwallace/Projects/nano-agent/tools"
-    
-    # Patch OpenAI where it is USED, not where it is defined
-    with patch('nano_agent.core.OpenAI') as MockOpenAI:
-        mock_client = MockOpenAI.return_value
-        
-        mock_response_1 = MagicMock()
-        mock_message_1 = MagicMock()
-        mock_tool_call = MagicMock()
-        mock_tool_call.function.name = "list_files"
-        mock_tool_call.function.arguments = "{'path': '.'}"
-        mock_tool_call.id = "call_123"
-        
-        mock_message_1.tool_calls = [mock_tool_call]
-        mock_message_1.content = None
-        mock_response_1.choices = [mock_message_1]
-        
-        mock_response_2 = MagicMock()
-        mock_message_2 = MagicMock()
-        mock_message_2.tool_calls = None
-        mock_message_2.content = "I found the files!"
-        mock_response_2.choices = [mock_message_2]
-        
-        mock_client.chat.completions.create.side_effect = [mock_response_1, mock_response_2]
-        
-        agent = NanoAgent(tools_dir=tools_dir)
-        
-        print(f"Discovered tools: {list(agent.registry.tools.keys())}")
-        assert "list_files" in agent.registry.tools
-        
-        result = agent.run("What files are here?")
-        print(f"Final result: {result}")
-        assert result == "I found the files!"
-        assert mock_client.chat.completions.create.call_count == 2
-        print("Test Passed!")
+
+class NanoLoopTest(unittest.TestCase):
+    def test_discovery_and_streamed_tool_loop(self):
+        with tempfile.TemporaryDirectory(prefix="nano-loop-test-") as temporary:
+            root = Path(temporary)
+            (root / "marker.txt").write_text("example", encoding="utf-8")
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(os.environ, {"HOME": temporary, "OPENAI_API_KEY": "test-key"}), \
+                     patch("nano_agent.core.ContextImporter.discover_and_import", return_value=[]):
+                    agent = Nano(confirm_callback=lambda name, args: False)
+                    self.assertIn("list_files", agent.registry.tools)
+
+                    call = SimpleNamespace(
+                        index=0,
+                        id="call_123",
+                        function=SimpleNamespace(name="list_files", arguments=json.dumps({"path": temporary})),
+                    )
+                    first = SimpleNamespace(choices=[SimpleNamespace(
+                        delta=SimpleNamespace(content=None, tool_calls=[call]))])
+                    second = SimpleNamespace(choices=[SimpleNamespace(
+                        delta=SimpleNamespace(content="I found the files!", tool_calls=None))])
+
+                    with patch.object(agent.client.chat.completions, "create", side_effect=[iter([first]), iter([second])]) as create:
+                        result = asyncio.run(agent.run("What files are here?"))
+
+                    self.assertEqual(result, "I found the files!")
+                    self.assertEqual(create.call_count, 2)
+                    tool_messages = [message for message in agent.messages if message.get("role") == "tool"]
+                    self.assertEqual(len(tool_messages), 1)
+                    self.assertIn("marker.txt", tool_messages[0]["content"])
+            finally:
+                os.chdir(previous)
+
 
 if __name__ == "__main__":
-    test_discovery_and_loop()
+    unittest.main()

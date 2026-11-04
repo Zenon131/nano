@@ -15,7 +15,6 @@ def write_file(path: str, content: str):
     Writes content to a file, completely replacing existing content.
     Use this to create new files or overwrite existing ones.
     """
-    write_file.unsafe = True
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w') as f:
         f.write(content)
@@ -26,7 +25,6 @@ def edit_file(path: str, old_string: str, new_string: str):
     Surgically replaces a specific string in a file with a new string.
     Useful for making small changes without overwriting the whole file.
     """
-    edit_file.unsafe = True
     with open(path, 'r') as f:
         content = f.read()
     
@@ -37,3 +35,8 @@ def edit_file(path: str, old_string: str, new_string: str):
     with open(path, 'w') as f:
         f.write(new_content)
     return f"Successfully updated {path}"
+
+
+# Set safety metadata before the registry discovers the functions.
+setattr(write_file, "unsafe", True)
+setattr(edit_file, "unsafe", True)

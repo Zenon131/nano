@@ -6,7 +6,6 @@ def run_command(command: str):
     Executes a shell command and returns the output. 
     WARNING: This is a dangerous tool.
     """
-    run_command.unsafe = True # Mark as dangerous for the harness
     try:
         result = subprocess.run(
             command, 
@@ -20,3 +19,7 @@ def run_command(command: str):
         return "Error: Command timed out after 30 seconds."
     except Exception as e:
         return f"Error executing command: {str(e)}"
+
+
+# The registry inspects this attribute when the module is loaded.
+setattr(run_command, "unsafe", True)
