@@ -5,11 +5,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def web_search(query: str):
-    \"\"\"
+    """
     Searches the web using the Tavily API to find current information, 
     news, or documentation. Returns a list of relevant results including 
     titles, URLs, and content snippets.
-    \"\"\"
+    """
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
         return "Error: TAVILY_API_KEY not found in environment variables."
