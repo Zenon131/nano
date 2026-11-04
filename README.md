@@ -19,6 +19,7 @@ pip install -e .
 Create a `.env` file in the root directory or set your environment variables:
 ```bash
 OPENAI_API_KEY=your_api_key_here
+TAVILY_API_KEY=your_tavily_key_here
 ```
 
 ### 3. Run
@@ -57,7 +58,15 @@ def create_issue(title: str, body: str):
 
 ---
 
-## 🛠️ Advanced Usage
+## 🛠️ Capabilities
+
+### 🔋 Built-in Powers
+Out of the box, `nanoc` is equipped to:
+- **Web Search**: Use Tavily to find current news, documentation, and real-time data.
+- **Explore**: List directories and read files across your system.
+- **Manipulate**: Create new files (`write_file`) and surgically edit existing ones (`edit_file`).
+- **Execute**: Run shell commands via `run_command`.
+- **Delegate**: Spawn specialized sub-agents for complex, multi-step reasoning.
 
 ### ⚡ Slash Commands
 Manage your agent's state without leaving the chat:
