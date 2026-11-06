@@ -61,15 +61,49 @@ def confirm_tool_call(name, args):
     console.print(f"\n[bold yellow]⚠️  Safety Warning:[/bold yellow] Nano wants to run [bold red]{escape(str(name))}[/bold red] with args: {escape(str(args))}")
     return Confirm.ask("Allow?", default=False)
 
-async def run_nano():
+def build_arg_parser():
     parser = argparse.ArgumentParser(description="Nano - The Transparent Shell Agent")
     parser.add_argument("--new", action="store_true", help="Start a fresh session")
-    args = parser.parse_args()
+    parser.add_argument("-p", "--prompt", metavar="TEXT",
+                        help="Run one prompt non-interactively (pipes/scripts) and exit")
+    parser.add_argument("--yes", action="store_true",
+                        help="Headless: auto-approve unsafe tool calls (default: denied)")
+    return parser
 
+async def run_headless(args) -> int:
+    """Single-prompt execution for scripts and CI.
+
+    Safe by default: unsafe tools are denied unless --yes is passed.
+    Returns the process exit code; the agent's streaming output is printed
+    exactly as in the interactive session (minus splash and status bar).
+    """
+    allow_unsafe = args.yes
+    headless_confirm = (lambda name, tool_args: allow_unsafe)
+    try:
+        agent = Nano(tools_dir=None, confirm_callback=headless_confirm, interactive=False)
+    except Exception as init_error:
+        try:
+            console.print(f"[bold red]Error initializing agent:[/bold red] {escape(str(init_error))}")
+        except Exception:
+            print(f"Error initializing agent: {init_error}", file=sys.stderr)
+        return 1
+    if not allow_unsafe:
+        console.print("[dim]Headless: unsafe tools are auto-denied; pass --yes to approve them.[/dim]")
+    try:
+        await agent.run(args.prompt)
+        return 0
+    except Exception as run_error:
+        try:
+            console.print(f"\n[bold red]Runtime Error:[/bold red] {escape(str(run_error))}\n")
+        except Exception:
+            print(f"Runtime Error: {run_error}", file=sys.stderr)
+        return 1
+
+async def run_interactive(args):
     print_splash()
     console.print("Type 'exit' or 'quit' to stop.")
     console.print("[dim](Enter to send, Alt+Enter for a new line)\n")
-    
+
     # Let the Nano core handle the default tools directory resolution
     tools_dir = None
     
@@ -113,7 +147,8 @@ async def run_nano():
         "/debug",
         "/clear",
         "/tokens",
-        "/tools"
+        "/tools",
+        "/undo"
     ]
     # Use a custom completer that only activates when the buffer starts with '/'
     # and contains ONLY the command (no other text).
@@ -189,10 +224,16 @@ def main():
     Synchronous entry point for the CLI.
     This is what the pyproject.toml entry point calls.
     """
+    args = build_arg_parser().parse_args()
+    exit_code = 0
     try:
-        asyncio.run(run_nano())
+        if args.prompt is not None:
+            exit_code = asyncio.run(run_headless(args))
+        else:
+            asyncio.run(run_interactive(args))
     except KeyboardInterrupt:
-        pass
+        exit_code = 130
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()

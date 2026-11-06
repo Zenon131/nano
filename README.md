@@ -78,15 +78,22 @@ Manage your agent's state without leaving the chat:
 | `/save <name>` | Archive the current conversation as a named session |
 | `/sessions` | List and teleport between past archived sessions |
 | `/context` | View all context imported from other agents (Hermes, OpenCode, etc.) |
-| `/debug` | Toggle the "Tool Calls & Telemetry" detail panel |
+| `/clear` | Wipe the current session history |
+| `/tokens` | Show approximate token usage of the current session |
+| `/tools` | List all available agent tools |
+| `/debug` | Toggle request telemetry (rounds, timing, tokens, session saves) |
+| `/undo` | Restore the workspace from the latest pre-edit snapshot |
 
 ### 📁 Session & Context Hub
 `nanoc` acts as a central hub for your AI history:
 - **Session Library**: All conversations are stored in `~/.nano/sessions/`. You can switch between them instantly using `/sessions`.
-- **Smart Import**: On startup, `nanoc` scans your system for history files from other agents (Hermes, OpenCode, OpenClaw). If it finds a compatible chat log, it imports it into the current session's context automatically.
+- **Smart Import**: On startup, `nanoc` scans your system for history from other agents (Hermes, OpenCode, Claude Code, OpenClaw). Found conversations are distilled into a compact *continuity digest* — recent exchanges trimmed and inserted into the system prompt as background — instead of flooding your context with hundreds of raw messages. Browse the full imported history with `/context`.
+- **Project Instructions**: Nano honors the cross-agent `AGENTS.md` convention. If an `AGENTS.md` exists in the working directory (or a parent), its rules are loaded into Nano's system prompt at startup, so the agent follows the same project instructions in shared repositories.
 
 ### 🛡️ Safety Gates
 Tools can be marked unsafe with `setattr(my_tool, "unsafe", True)` at module level, before Nano discovers them. Unsafe built-ins such as `run_command`, `write_file`, and `edit_file` require approval in the CLI; if no confirmation callback is available, Nano denies execution. Sub-agents inherit the parent agent's confirmation callback.
+
+Approved destructive calls get a rollback point first: Nano archives the workspace into `~/.nano/snapshots/` before the first file-changing tool runs in a round. `/undo` lists the latest snapshots and can restore the newest one (with confirmation); caches, dependency folders and VCS metadata are never archived.
 
 ---
 
@@ -105,6 +112,16 @@ For OpenRouter, set `OPENROUTER_API_KEY` in your shell before launching `nanoc`,
 ```
 
 The exact model ID stays paired with OpenRouter's `https://openrouter.ai/api/v1` endpoint. Use `/provider ollama` to switch back to Ollama, and `/model` to select an installed Ollama model. Ollama may also offer cloud models; choose a local model if you need local-only inference.
+
+### Headless / one-shot mode
+For scripts and CI, run a single prompt non-interactively:
+
+```bash
+nanoc -p "summarize the changes in src/ and write NOTES.md"   # read-only work
+nanoc -p "fix the failing test in tests/" --yes               # allow file edits
+```
+
+Unsafe tools are **denied by default** in headless mode; pass `--yes` to auto-approve them for fully automated runs. The process exits `0` on success and `1` when the agent hits a runtime error.
 
 For another OpenAI-compatible endpoint, select `/provider custom`, use `/config` → `url` to set its base URL, and use `/config` → `key` to specify the **name** of an environment variable containing its API key (default `CUSTOM_API_KEY`). Set that variable before starting Nano, then enter `/model <exact-model-id>`. The `/provider` and `/model` commands also offer interactive menus when run without arguments.
 
