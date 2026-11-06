@@ -83,6 +83,7 @@ Manage your agent's state without leaving the chat:
 | `/tools` | List all available agent tools |
 | `/debug` | Toggle request telemetry (rounds, timing, tokens, session saves) |
 | `/undo` | Restore the workspace from the latest pre-edit snapshot |
+| `/auto` | Toggle auto-approval of file edits and shell commands |
 
 ### 📁 Session & Context Hub
 `nanoc` acts as a central hub for your AI history:
@@ -118,10 +119,13 @@ For scripts and CI, run a single prompt non-interactively:
 
 ```bash
 nanoc -p "summarize the changes in src/ and write NOTES.md"   # read-only work
-nanoc -p "fix the failing test in tests/" --yes               # allow file edits
+nanoc -p "fix the failing test in tests/" --auto              # allow file edits
 ```
 
-Unsafe tools are **denied by default** in headless mode; pass `--yes` to auto-approve them for fully automated runs. The process exits `0` on success and `1` when the agent hits a runtime error.
+Unsafe tools are **denied by default** in headless mode; pass `--auto` (alias `-y` or `--yes`) to auto-approve them for fully automated runs. The process exits `0` on success and `1` when the agent hits a runtime error.
+
+### Auto-approve mode
+For hands-free sessions, start with `nanoc --auto` (or `-y`), or type `/auto` mid-session to toggle. While enabled, `write_file`, `edit_file`, and `run_command` execute without confirmation — the status bar shows a persistent `⚡ AUTO` segment so the mode is never forgotten, and `/undo` snapshots are still taken before every destructive call as a rollback net. Auto mode is never stored: it must be an explicit choice each time you launch or toggle it. Sub-agents inherit the parent's mode.
 
 For another OpenAI-compatible endpoint, select `/provider custom`, use `/config` → `url` to set its base URL, and use `/config` → `key` to specify the **name** of an environment variable containing its API key (default `CUSTOM_API_KEY`). Set that variable before starting Nano, then enter `/model <exact-model-id>`. The `/provider` and `/model` commands also offer interactive menus when run without arguments.
 

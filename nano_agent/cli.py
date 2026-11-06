@@ -66,18 +66,19 @@ def build_arg_parser():
     parser.add_argument("--new", action="store_true", help="Start a fresh session")
     parser.add_argument("-p", "--prompt", metavar="TEXT",
                         help="Run one prompt non-interactively (pipes/scripts) and exit")
-    parser.add_argument("--yes", action="store_true",
-                        help="Headless: auto-approve unsafe tool calls (default: denied)")
+    parser.add_argument("-y", "--auto", "--yes", action="store_true",
+                        help="Auto-approve unsafe tools: file edits and shell commands run "
+                             "without asking (/undo snapshots are still kept; /auto toggles)")
     return parser
 
 async def run_headless(args) -> int:
     """Single-prompt execution for scripts and CI.
 
-    Safe by default: unsafe tools are denied unless --yes is passed.
-    Returns the process exit code; the agent's streaming output is printed
-    exactly as in the interactive session (minus splash and status bar).
+    Safe by default: unsafe tools are denied unless --auto (or --yes) is
+    passed. Returns the process exit code; the agent's streaming output is
+    printed exactly as in the interactive session (minus the splash/status bar).
     """
-    allow_unsafe = args.yes
+    allow_unsafe = args.auto
     headless_confirm = (lambda name, tool_args: allow_unsafe)
     try:
         agent = Nano(tools_dir=None, confirm_callback=headless_confirm, interactive=False)
@@ -88,7 +89,7 @@ async def run_headless(args) -> int:
             print(f"Error initializing agent: {init_error}", file=sys.stderr)
         return 1
     if not allow_unsafe:
-        console.print("[dim]Headless: unsafe tools are auto-denied; pass --yes to approve them.[/dim]")
+        console.print("[dim]Headless: unsafe tools are auto-denied; pass --auto to approve them.[/dim]")
     try:
         await agent.run(args.prompt)
         return 0
@@ -109,15 +110,16 @@ async def run_interactive(args):
     
     try:
         agent = Nano(
-            tools_dir=tools_dir, 
-            confirm_callback=confirm_tool_call
+            tools_dir=tools_dir,
+            confirm_callback=confirm_tool_call,
+            auto_approve=args.auto
         )
-        
+
         if args.new:
             agent.session.clear_session()
             agent.messages = agent.messages[:1] # Keep only system prompt
             console.print("[dim]Started fresh session.[/dim]")
-            
+
     except Exception as e:
         console.print(f"[bold red]Error initializing agent:[/bold red] {escape(str(e))}")
         sys.exit(1)
@@ -127,11 +129,18 @@ async def run_interactive(args):
     console.print(f"[dim]connected · {escape(agent.provider)} · {escape(agent.model or 'no model set')} · "
                   f"{len(agent.registry.schemas)} tools · {session_state} session ({len(agent.messages)} msgs)[/dim]\n")
 
+    # Auto mode must never be invisible: loud banner at startup, persistent
+    # AUTO segment in the status bar while it is on.
+    if agent.auto_approve:
+        console.print("[bold yellow]⚡ Auto-approve enabled: file edits and shell commands will run WITHOUT asking. "
+                      "/undo snapshots are still kept. Type /auto to disable.[/bold yellow]\n")
+
     # A dynamic status bar that lives at the bottom of the screen.
     # It updates every render cycle: provider, model, live context size.
     def get_status_bar():
         try:
-            return f" Nano | {agent.provider} | {agent.model} | {len(agent.messages)} msgs | Ctrl+K for help "
+            auto_segment = " | ⚡ AUTO" if agent.auto_approve else ""
+            return f" Nano | {agent.provider} | {agent.model}{auto_segment} | {len(agent.messages)} msgs | Ctrl+K for help "
         except AttributeError:
             return " Nano | Initializing... "
 
@@ -148,7 +157,8 @@ async def run_interactive(args):
         "/clear",
         "/tokens",
         "/tools",
-        "/undo"
+        "/undo",
+        "/auto"
     ]
     # Use a custom completer that only activates when the buffer starts with '/'
     # and contains ONLY the command (no other text).

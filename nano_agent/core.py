@@ -458,7 +458,7 @@ class Nano:
     def __init__(self, tools_dir: Optional[str] = None, model: str = "gpt-4o",
                  confirm_callback: Optional[Callable[[str, Dict], bool]] = None,
                  is_subagent: bool = False, provider_config: Optional[Dict[str, Any]] = None,
-                 interactive: bool = True):
+                 interactive: bool = True, auto_approve: bool = False):
 
         # Must be set before _register_core_tools() so sub-agents don't get
         # the spawn_sub_agent tool registered/advertised at all.
@@ -466,6 +466,10 @@ class Nano:
         # Headless runs can't answer interactive dialogs (provider pickers,
         # undo confirmation); they get a clean refusal instead of hanging.
         self.interactive = interactive
+        # Auto-approve mode ("yolo"): unsafe tools run without confirmation.
+        # Deliberately NOT persisted — it must always be an explicit, visible
+        # choice (CLI flag or /auto), and the status bar shows it while on.
+        self.auto_approve = auto_approve
         config = self._load_config()
         self._provider_snapshot = _provider_config_snapshot(config)
         self.provider_settings = ProviderSettings(provider_config if provider_config is not None else config, default_model=model)
@@ -832,7 +836,8 @@ class Nano:
                 return "Error: Sub-agents cannot spawn further sub-agents to prevent recursive loops."
             sub = Nano(tools_dir=str(self.registry.tools_dir), model=self.model,
                        confirm_callback=self.confirm_callback, is_subagent=True,
-                       provider_config=self.provider_settings.serialized())
+                       provider_config=self.provider_settings.serialized(),
+                       auto_approve=self.auto_approve)
             sub.messages[0]["content"] = f"You are a Nano sub-agent. Your specific goal is: {goal}. Provide a final answer when complete."
             return await sub.run(goal)
         
@@ -886,6 +891,7 @@ class Nano:
                 help_table.add_row("/tokens", "Show current session token usage")
                 help_table.add_row("/tools", "List all available agent tools")
                 help_table.add_row("/undo", "Restore workspace from the latest pre-edit snapshot")
+                help_table.add_row("/auto", "Toggle auto-approval of file edits and shell commands")
                 console.print(Panel(help_table, border_style="magenta"))
                 return "Help menu displayed."
             
@@ -1008,6 +1014,15 @@ class Nano:
             if user_input_strip == "/undo":
                 self._handle_undo()
                 return "Undo handled."
+            if user_input_strip == "/auto":
+                self.auto_approve = not self.auto_approve
+                if self.auto_approve:
+                    console.print("[bold yellow]⚡ Auto-approve ENABLED — file edits and shell commands "
+                                  "run WITHOUT asking. Snapshots still taken for /undo. "
+                                  "Type /auto again to re-enable confirmations.[/bold yellow]")
+                else:
+                    console.print("[green]✓ Auto-approve disabled — unsafe tools will ask before running again.[/green]")
+                return f"Auto-approve {'enabled' if self.auto_approve else 'disabled'}."
 
         return await self._run_goal(user_input)
 
@@ -1157,9 +1172,13 @@ class Nano:
 
         try:
             if is_unsafe:
-                if self.confirm_callback is None:
+                if self.auto_approve:
+                    # Permission dialogs are skipped in auto mode; the
+                    # snapshot below still runs as the rollback safety net.
+                    console.print(f"[dim]⚡ auto-approved {escape(name)}[/dim]")
+                elif self.confirm_callback is None:
                     return "Error: Unsafe tool requires a confirmation callback; execution denied."
-                if not self.confirm_callback(name, args):
+                elif not self.confirm_callback(name, args):
                     console.print(f"[red]✘ User denied execution of {escape(name)}[/red]")
                     return "Error: User denied execution of this tool."
                 # Approved destructive calls get a rollback point first, so
