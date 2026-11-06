@@ -2,25 +2,68 @@ import os
 import json
 import copy
 import re
+import time
+import glob
+import sqlite3
 import tempfile
 from contextlib import contextmanager
 import requests
 import asyncio
 from pathlib import Path
 from urllib.parse import urlparse
-from typing import List, Dict, Any, Optional, Callable, Union, Tuple
+from typing import List, Dict, Any, Optional, Callable, Tuple
 from openai import OpenAI
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
 from rich.prompt import Prompt, Confirm
+from nano_agent.ui import (
+    render_tool_call,
+    render_tool_result,
+    create_thinking_indicator
+)
+from rich.markdown import Markdown
 from nano_agent.tools import ToolRegistry, generate_tool_schema
 from nano_agent.providers import ProviderSettings, infer_legacy_provider
 from dotenv import load_dotenv
 
 load_dotenv()
 console = Console()
+
+# Safety cap on tool-call rounds per user message: beyond this, tools are
+# withheld so the model must produce a final answer instead of looping.
+MAX_TOOL_ROUNDS = 25
+
+# Force-flush threshold for markdown streaming: paragraphs render as they
+# complete, but a single very long paragraph shouldn't stay invisible forever.
+MAX_MD_PENDING = 1500
+
+
+def _split_complete_markdown(buffer: str) -> Tuple[str, str]:
+    """Split streamed text into (renderable, pending) at the last paragraph
+    break that is outside a code fence, so incomplete blocks stay pending."""
+    fence = False
+    safe_end = 0
+    pos = 0
+    for line in buffer.split("\n"):
+        if line.strip().startswith("```"):
+            fence = not fence
+        pos += len(line) + 1
+        # Only paragraph breaks OUTSIDE code fences are safe to render at.
+        if not fence and line == "":
+            safe_end = pos
+    return buffer[:safe_end], buffer[safe_end:]
+
+
+def _render_markdown_stream(text: str):
+    """Render one chunk of streamed markdown; falls back to plain text if
+    the markdown renderer chokes on malformed input."""
+    try:
+        console.print(Markdown(text))
+    except Exception:
+        console.print(text, end="", markup=False, highlight=False)
 
 
 @contextmanager
@@ -54,119 +97,243 @@ def _provider_config_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class ContextImporter:
-    """Discovers and imports history from other AI agent frameworks."""
-    
-    # Known high-confidence signatures: {agent_name: (path_pattern, schema_type)}
-    SIGNATURES = {
-        "Hermes": ("~/.hermes/**/*.json", "openai"), # Use glob for profiles
-        "OpenCode": ("~/.opencode/history.json", "generic"),
-        "OpenClaw": ("~/.openclaw/sessions", "generic"),
+    """Discovers and imports recent conversation history from other terminal
+    agents (OpenCode, Claude Code, Hermes, OpenClaw).
+
+    Instead of a naive sweep of every JSON file, this reads each agent's
+    *native* storage format: SQLite databases for Hermes and OpenCode, and
+    JSONL session transcripts for Claude Code. Only real conversation turns
+    (user/assistant with non-empty text) are imported, capped to the most
+    recent messages per source, so startup stays fast and context stays clean.
+    """
+
+    # Import recent context, not full histories.
+    MAX_MESSAGES_PER_SOURCE = 200
+    # Guards for transcript sweeps on machines with very large histories.
+    MAX_FILES_PER_SOURCE = 50
+    MAX_TRANSCRIPT_LINES = 5000
+
+    # SQLite-backed agents: candidate database paths (glob patterns allowed).
+    SQLITE_SOURCES = {
+        "hermes": [
+            "~/.hermes/state.db",
+            "~/.hermes/profiles/*/state.db",
+        ],
+        "opencode": [
+            "~/.local/share/opencode/opencode.db",
+            "~/Library/Application Support/opencode/opencode.db",
+            "~/AppData/Local/opencode/opencode.db",
+            "~/AppData/Roaming/opencode/opencode.db",
+        ],
     }
 
-    # Directories to scan for generalized history search
-    SEARCH_DIRS = [
-        Path("~/.config").expanduser(),
-        Path("~/.local/share").expanduser(),
-        Path("~/Library/Application Support").expanduser(),
-        Path("~").expanduser(),
-    ]
-
-    # File patterns that typically indicate agent history
-    FILE_PATTERNS = ["*history*.json", "*session*.json", ".nano_history", "history.json", "chat_*.json"]
+    # Transcript-file agents: candidate dirs and file patterns.
+    FILE_SOURCES = {
+        "claude_code": (
+            ["~/.claude/projects", "~/.claude/sessions"],
+            ["*.jsonl"],
+        ),
+        "openclaw": (
+            ["~/.openclaw", "~/.config/openclaw", "~/Library/Application Support/openclaw"],
+            ["*.jsonl", "*session*.json", "*history*.json", "*conversation*.json"],
+        ),
+    }
 
     @staticmethod
-    def normalize(messages: List[Dict], schema: str) -> List[Dict]:
-        normalized = []
-        for m in messages:
-            if not isinstance(m, dict): continue
-            if schema == "openai":
-                normalized.append(m)
-            elif schema == "generic":
-                role = m.get("role") or ("user" if "user" in m else "assistant")
-                content = m.get("content") or m.get("text") or str(m)
-                normalized.append({"role": role, "content": content})
-        return normalized
-
-    def _is_chat_history(self, data: Any) -> bool:
-        """Heuristic to determine if a JSON object is likely a chat history."""
-        if not isinstance(data, list) or not data:
+    def _valid_message(msg: Any) -> bool:
+        """A usable conversation turn: user/assistant role with real text content."""
+        if not isinstance(msg, dict):
             return False
-        
-        # Chat-like keys to look for
-        chat_keys = {"role", "content", "text", "message", "prompt", "response", "user", "assistant"}
-        
-        # Sample first few entries
-        found_keys = set()
-        for entry in data[:5]:
-            if isinstance(entry, dict):
-                found_keys.update(entry.keys())
-        
-        # If it contains at least a few of the common chat keys, it's a candidate
-        return len(found_keys.intersection(chat_keys)) >= 1
+        role = msg.get("role")
+        content = msg.get("content")
+        return role in ("user", "assistant") and isinstance(content, str) and bool(content.strip())
 
-    def _generalized_search(self) -> List[Tuple[str, Dict]]:
-        discovered = []
-        for directory in self.SEARCH_DIRS:
-            if not directory.exists():
-                continue
-            
+    def _import_hermes_db(self, path: Path) -> List[Dict]:
+        """Hermes stores conversations in SQLite (messages table with role/content)."""
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             try:
-                # Use rglob to find patterns recursively but limit depth to avoid hanging
-                for pattern in self.FILE_PATTERNS:
-                    for path in directory.glob(pattern):
-                        # Skip very large files to prevent memory issues
-                        if path.stat().st_size > 10 * 1024 * 1024: continue
-                        
+                cur = conn.execute(
+                    "SELECT role, content FROM messages "
+                    "WHERE role IN ('user','assistant') AND content IS NOT NULL "
+                    "AND length(content) > 0 ORDER BY timestamp DESC LIMIT ?",
+                    (self.MAX_MESSAGES_PER_SOURCE,),
+                )
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return []
+        # Rows are newest-first; reverse into chronological order.
+        return [{"role": role, "content": content} for role, content in reversed(rows)]
+
+    def _import_opencode_db(self, path: Path) -> List[Dict]:
+        """OpenCode stores sessions in SQLite (message + part tables with JSON data)."""
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                cur = conn.execute(
+                    "SELECT m.id, m.data, p.data FROM message m "
+                    "JOIN part p ON p.message_id = m.id "
+                    "WHERE json_extract(p.data, '$.type') = 'text' "
+                    "ORDER BY m.time_created DESC, p.time_created LIMIT ?",
+                    (self.MAX_MESSAGES_PER_SOURCE * 4,),
+                )
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return []
+
+        # Group text parts by message id (rows come newest-first).
+        grouped = {}
+        order = []
+        for msg_id, msg_data, part_data in rows:
+            try:
+                role = json.loads(msg_data).get("role")
+                text = json.loads(part_data).get("text")
+            except Exception:
+                continue
+            if role not in ("user", "assistant") or not isinstance(text, str) or not text.strip():
+                continue
+            if msg_id not in grouped:
+                grouped[msg_id] = {"role": role, "parts": []}
+                order.append(msg_id)
+            grouped[msg_id]["parts"].append(text)
+
+        messages = [
+            {"role": grouped[mid]["role"], "content": "\n".join(grouped[mid]["parts"])}
+            for mid in reversed(order)
+        ]
+        return messages[-self.MAX_MESSAGES_PER_SOURCE:]
+
+    @classmethod
+    def _extract_turns(cls, entry: Any) -> List[Dict]:
+        """Extract user/assistant turns from a Claude Code style transcript entry.
+
+        Handles both flat entries and Claude's nested 'message' wrapper, with
+        content as either a plain string or a list of content blocks.
+        """
+        if not isinstance(entry, dict):
+            return []
+        turns = []
+        # Some formats nest turn lists under a 'messages' key.
+        if isinstance(entry.get("messages"), list):
+            for sub in entry["messages"]:
+                turns.extend(cls._extract_turns(sub))
+            return turns
+        inner = entry.get("message") if isinstance(entry.get("message"), dict) else entry
+        role = inner.get("role") or entry.get("type")
+        content = inner.get("content")
+        if content is None and isinstance(inner.get("text"), str):
+            content = inner["text"]
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+                elif isinstance(block, str):
+                    parts.append(block)
+            content = "\n".join(parts)
+        turn = {"role": role, "content": content}
+        return [turn] if cls._valid_message(turn) else []
+
+    def _read_json_safe(self, path: Path) -> Any:
+        """Safely read and parse a JSON file, returning None on any failure."""
+        try:
+            if path.stat().st_size > 10 * 1024 * 1024:  # 10MB limit
+                return None
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _import_transcript_file(self, path: Path) -> List[Dict]:
+        """Parse a JSONL transcript (or JSON array of turns) into messages."""
+        messages = []
+        if path.suffix == ".json":
+            data = self._read_json_safe(path)
+            entries = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+            for entry in entries:
+                messages.extend(self._extract_turns(entry))
+        else:  # JSONL and friends: one JSON object per line
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for i, line in enumerate(f):
+                        if i >= self.MAX_TRANSCRIPT_LINES:
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
                         try:
-                            with open(path, "r") as f:
-                                data = json.load(f)
-                                if self._is_chat_history(data):
-                                    # Label by the filename or parent folder
-                                    source_name = f"Auto({path.name})"
-                                    normalized = self.normalize(data, "generic")
-                                    for msg in normalized:
-                                        discovered.append((source_name, msg))
+                            messages.extend(self._extract_turns(json.loads(line)))
                         except Exception:
                             continue
             except Exception:
+                return []
+        return messages[-self.MAX_MESSAGES_PER_SOURCE:]
+
+    def _scan_file_source(self, dirs: List[str], patterns: List[str]) -> List[Dict]:
+        """Find the newest transcript files under candidate dirs and parse them."""
+        candidates = set()
+        for dir_pattern in dirs:
+            base = Path(dir_pattern).expanduser()
+            if not base.is_dir():
                 continue
-        return discovered
+            for pattern in patterns:
+                try:
+                    candidates.update(base.rglob(pattern))
+                except Exception:
+                    continue
+        # Prefer the most recently modified transcripts.
+        def mtime(p):
+            try:
+                return p.stat().st_mtime
+            except Exception:
+                return 0
+        files = sorted(candidates, key=mtime, reverse=True)[:self.MAX_FILES_PER_SOURCE]
+
+        collected = []
+        for path in files:
+            collected.extend(self._import_transcript_file(path))
+        return collected[-self.MAX_MESSAGES_PER_SOURCE:]
 
     def discover_and_import(self) -> List[Tuple[str, Dict]]:
-        imported_messages = []
-        
-        # 1. Check known signatures first (high confidence)
-        for agent, (pattern, schema) in self.SIGNATURES.items():
-            # Handle glob patterns in signatures
-            if "*" in pattern:
-                paths = list(Path(pattern).expanduser().glob("**/*.json"))
-                for path in paths:
-                    try:
-                        with open(path, "r") as f:
-                            data = json.load(f)
-                            if isinstance(data, list):
-                                normalized = self.normalize(data, schema)
-                                for msg in normalized:
-                                    imported_messages.append((agent, msg))
-                    except Exception:
+        """Return (source_agent, message) tuples for recently used agent histories."""
+        imported: List[Tuple[str, Dict]] = []
+        seen = set()
+        per_source: Dict[str, int] = {}
+
+        def add(agent: str, messages: List[Dict]) -> None:
+            for msg in messages:
+                if not self._valid_message(msg):
+                    continue
+                if per_source.get(agent, 0) >= self.MAX_MESSAGES_PER_SOURCE:
+                    return
+                key = (msg["role"], msg["content"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                imported.append((agent, {"role": msg["role"], "content": msg["content"]}))
+                per_source[agent] = per_source.get(agent, 0) + 1
+
+        # 1. SQLite-backed agents (Hermes, OpenCode)
+        for agent, patterns in self.SQLITE_SOURCES.items():
+            for pattern in patterns:
+                for match in glob.glob(os.path.expanduser(pattern)):
+                    path = Path(match)
+                    if not path.is_file():
                         continue
-            else:
-                path = Path(pattern).expanduser()
-                if path.exists():
-                    try:
-                        with open(path, "r") as f:
-                            data = json.load(f)
-                            if isinstance(data, list):
-                                normalized = self.normalize(data, schema)
-                                for msg in normalized:
-                                    imported_messages.append((agent, msg))
-                    except Exception:
-                        continue
-        
-        # 2. Run generalized search for unknown agents
-        imported_messages.extend(self._generalized_search())
-        
-        return imported_messages
+                    if agent == "hermes":
+                        add(agent, self._import_hermes_db(path))
+                    else:
+                        add(agent, self._import_opencode_db(path))
+
+        # 2. Transcript-file agents (Claude Code, OpenClaw)
+        for agent, (dirs, patterns) in self.FILE_SOURCES.items():
+            add(agent, self._scan_file_source(dirs, patterns))
+
+        return imported
 
 class SessionManager:
     def __init__(self, sessions_dir: str = "~/.nano/sessions"):
@@ -221,6 +388,9 @@ class Nano:
                  confirm_callback: Optional[Callable[[str, Dict], bool]] = None,
                  is_subagent: bool = False, provider_config: Optional[Dict[str, Any]] = None):
         
+        # Must be set before _register_core_tools() so sub-agents don't get
+        # the spawn_sub_agent tool registered/advertised at all.
+        self.is_subagent = is_subagent
         config = self._load_config()
         self._provider_snapshot = _provider_config_snapshot(config)
         self.provider_settings = ProviderSettings(provider_config if provider_config is not None else config, default_model=model)
@@ -489,9 +659,31 @@ class Nano:
         else:
             console.print("[green]Provider configuration updated.[/green]")
 
+    def _repair_interrupted_transcript(self):
+        """Synthesize tool results for any pending tool calls so the transcript
+        stays valid — an unanswered tool call makes every later request 400."""
+        if not self.messages:
+            return
+        last = self.messages[-1]
+        if last.get("role") != "assistant" or not last.get("tool_calls"):
+            return
+        for tc in last["tool_calls"]:
+            self.messages.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "name": tc["function"]["name"],
+                "content": "Error: execution was interrupted before this tool completed.",
+            })
+        console.print("[yellow]⚠ Interrupted mid-tool; transcript repaired so the session stays usable.[/yellow]")
+
+    def _debug_print(self, message: str):
+        """Prints telemetry lines only when /debug telemetry is enabled."""
+        if self.debug_enabled:
+            console.print(f"[dim cyan]{message}[/dim cyan]")
+
     def _register_core_tools(self):
         async def spawn_sub_agent(goal: str):
-            if not hasattr(self, 'session') or self.session is None:
+            if getattr(self, "is_subagent", False) or self.session is None:
                 return "Error: Sub-agents cannot spawn further sub-agents to prevent recursive loops."
             sub = Nano(tools_dir=str(self.registry.tools_dir), model=self.model,
                        confirm_callback=self.confirm_callback, is_subagent=True,
@@ -500,12 +692,18 @@ class Nano:
             return await sub.run(goal)
         
         spawn_sub_agent.__doc__ = "Spawns a specialized sub-agent for complex multi-step tasks. DO NOT use for simple direct actions."
-        self.registry.tools["spawn_sub_agent"] = spawn_sub_agent
-        self.registry.schemas.append(generate_tool_schema(spawn_sub_agent, priority=3))
+        # Only the top-level agent may delegate; sub-agents don't get the
+        # tool registered at all so they can't waste a round on it.
+        if not getattr(self, "is_subagent", False):
+            self.registry.tools["spawn_sub_agent"] = spawn_sub_agent
+            self.registry.schemas.append(generate_tool_schema(spawn_sub_agent, priority=3))
 
         async def ask_user(question: str):
-            console.print(Panel(Text(f"Agent is asking: {question}", style="bold yellow"), title="User Query"))
-            return Prompt.ask("[bold blue]Your Answer[/bold blue]")
+            # Escape the model-generated question: brackets in it would be
+            # parsed as rich markup (MarkupError).
+            console.print(f"\n[bold yellow]❓ {escape(question)}[/bold yellow]")
+            # Use a simple prompt without the "Your Answer:" label to keep it clean
+            return Prompt.ask("", default="")
         
         ask_user.__doc__ = "Use this tool to ask the user for clarification, missing information, or a decision."
         self.registry.tools["ask_user"] = ask_user
@@ -516,107 +714,152 @@ class Nano:
         if self.session is None:
             return await self._run_goal(user_input)
         user_input_strip = user_input.strip()
-        if user_input_strip == "/help":
-            help_table = Table(title="Nano Slash Commands", expand=True, border_style="magenta")
-            help_table.add_column("Command", style="cyan", no_wrap=True)
-            help_table.add_column("Description", style="white")
-            help_table.add_row("/help", "Show this list of available slash commands")
-            help_table.add_row("/save <name>", "Archive current session with a name")
-            help_table.add_row("/sessions", "List and switch between past sessions")
-            help_table.add_row("/context", "View context imported from other agents")
-            help_table.add_row("/provider [name]", "Select a provider and its saved settings")
-            help_table.add_row("/model [model-id]", "Select a model for the active provider")
-            help_table.add_row("/config", "Configure the active provider's URL and key environment variable")
-            help_table.add_row("/debug", "Toggle the 'Tool Calls & Telemetry' window")
-            console.print(Panel(help_table, border_style="magenta"))
-            return "Help menu displayed."
-        if user_input_strip.startswith("/save "):
-            name = user_input_strip[6:].strip()
-            if not name:
+        
+        # Strictly enforce that slash commands only work if they are the ONLY content
+        # This prevents the agent from interpreting "/" in a sentence as a command.
+        if user_input_strip.startswith("/"):
+            # Split by whitespace to see if there are multiple words
+            parts = user_input_strip.split()
+            
+            # For commands that take arguments (like /save or /provider), 
+            # they are allowed as long as they are the only "instruction" in the message.
+            # We check if the command is one of our recognized triggers.
+            
+            if user_input_strip == "/help":
+                help_table = Table(title="Nano Slash Commands", expand=True, border_style="magenta")
+                help_table.add_column("Command", style="cyan", no_wrap=True)
+                help_table.add_column("Description", style="white")
+                help_table.add_row("/help", "Show this list of available slash commands")
+                help_table.add_row("/save <name>", "Archive current session with a name")
+                help_table.add_row("/sessions", "List and switch between past sessions")
+                help_table.add_row("/context", "View context imported from other agents")
+                help_table.add_row("/provider [name]", "Select a provider and its saved settings")
+                help_table.add_row("/model [model-id]", "Select a model for the active provider")
+                help_table.add_row("/config", "Configure the active provider's URL and key environment variable")
+                help_table.add_row("/debug", "Toggle request telemetry (rounds, tokens, timing, session saves)")
+                help_table.add_row("/clear", "Wipe current session history")
+                help_table.add_row("/tokens", "Show current session token usage")
+                help_table.add_row("/tools", "List all available agent tools")
+                console.print(Panel(help_table, border_style="magenta"))
+                return "Help menu displayed."
+            
+            if user_input_strip == "/save":
                 console.print("[bold red]Error: Please provide a session name. (e.g. /save project-x)[/bold red]")
                 return "Save failed: missing name."
-            
-            if self.session:
-                self.session.save_session(self.messages, session_id=name)
-                console.print(f"[bold green]✓ Session archived as {name}[/bold green]")
-                return f"Session saved as {name}."
-            else:
-                console.print("[bold red]Error: Session manager not available.[/bold red]")
-                return "Save failed."
-        if user_input_strip == "/sessions":
-            if self.session is None:
-                console.print("[bold red]Session manager not available (sub-agent mode).[/bold red]")
-                return "Session management is disabled for sub-agents."
-            
-            sessions = self.session.list_sessions()
-            if not sessions:
-                console.print("[dim]No archived sessions found.[/dim]")
-                return "No archived sessions."
-            
-            sess_table = Table(title="Past Sessions", expand=True, border_style="magenta")
-            sess_table.add_column("ID", style="cyan", no_wrap=True)
-            sess_table.add_column("Date", style="dim")
-            
-            for s in sessions:
-                from datetime import datetime
-                date_str = datetime.fromtimestamp(s["date"]).strftime("%Y-%m-%d %H:%M")
-                sess_table.add_row(s["id"], date_str)
-            
-            console.print(Panel(sess_table, border_style="magenta"))
-            choice = Prompt.ask("\n[bold magenta]Enter Session ID to load (or press Enter to cancel)[/bold magenta]")
-            
-            if choice:
-                # Save current state before switching
-                self.session.save_session(self.messages, session_id=f"backup_{int(asyncio.get_event_loop().time())}")
+            if user_input_strip.startswith("/save "):
+                name = user_input_strip[6:].strip()
+                if not name:
+                    console.print("[bold red]Error: Please provide a session name. (e.g. /save project-x)[/bold red]")
+                    return "Save failed: missing name."
                 
-                new_messages = self.session.load_session(session_id=choice)
-                if new_messages:
-                    self.messages = new_messages
-                    # Ensure system prompt is preserved
-                    self.messages[0] = {"role": "system", "content": self.system_prompt}
-                    console.print(f"[bold green]✓ Loaded session {choice}[/bold green]")
-                    return f"Switched to session {choice}."
+                if self.session:
+                    self.session.save_session(self.messages, session_id=name)
+                    console.print(f"[bold green]✓ Session archived as {name}[/bold green]")
+                    return f"Session saved as {name}."
                 else:
-                    console.print("[bold red]Failed to load session.[/bold red]")
-                    return "Session load failed."
-            return "Session switch cancelled."
-        if user_input_strip == "/context":
-            if not self.imported_context:
-                console.print("[dim]No imported context found.[/dim]")
-                return "No imported context."
+                    console.print("[bold red]Error: Session manager not available.[/bold red]")
+                    return "Save failed."
             
-            ctx_table = Table(title="Imported Context", expand=True, border_style="magenta")
-            ctx_table.add_column("Source", style="cyan", width=12)
-            ctx_table.add_column("Role", style="magenta", width=10)
-            ctx_table.add_column("Content", style="white")
+            if user_input_strip == "/sessions":
+                if self.session is None:
+                    console.print("[bold red]Session manager not available (sub-agent mode).[/bold red]")
+                    return "Session management is disabled for sub-agents."
+                
+                sessions = self.session.list_sessions()
+                if not sessions:
+                    console.print("[dim]No archived sessions found.[/dim]")
+                    return "No archived sessions."
+                
+                sess_table = Table(title="Past Sessions", expand=True, border_style="magenta")
+                sess_table.add_column("ID", style="cyan", no_wrap=True)
+                sess_table.add_column("Date", style="dim")
+                
+                for s in sessions:
+                    from datetime import datetime
+                    date_str = datetime.fromtimestamp(s["date"]).strftime("%Y-%m-%d %H:%M")
+                    sess_table.add_row(escape(s["id"]), date_str)
+                
+                console.print(Panel(sess_table, border_style="magenta"))
+                choice = Prompt.ask("\n[bold magenta]Enter Session ID to load (or press Enter to cancel)[/bold magenta]")
+                
+                if choice:
+                    self.session.save_session(self.messages, session_id=f"backup_{int(time.time())}")
+                    new_messages = self.session.load_session(session_id=choice)
+                    if new_messages:
+                        self.messages = new_messages
+                        self.messages[0] = {"role": "system", "content": self.system_prompt}
+                        console.print(f"[bold green]✓ Loaded session {choice}[/bold green]")
+                        return f"Switched to session {choice}."
+                    else:
+                        console.print("[bold red]Failed to load session.[/bold red]")
+                        return "Session load failed."
+                return "Session switch cancelled."
             
-            for source, msg in self.imported_context:
-                content = msg.get("content", "")
-                # Truncate long messages for the table
-                display_content = (content[:100] + "...") if len(content) > 100 else content
-                ctx_table.add_row(source, msg.get("role", "unknown"), display_content)
+            if user_input_strip == "/clear":
+                if self.session:
+                    self.session.clear_session()
+                self.messages = [{"role": "system", "content": self.system_prompt}]
+                console.print("[bold green]✓ Session history cleared.[/bold green]")
+                return "Session cleared."
             
-            console.print(Panel(ctx_table, border_style="magenta"))
-            return f"Displayed {len(self.imported_context)} imported messages."
-        if user_input_strip == "/provider":
-            self._handle_provider_selection()
-            return "Provider selection complete."
-        if user_input_strip.startswith("/provider "):
-            self._select_provider(user_input_strip[len("/provider "):].strip())
-            return "Provider selection complete."
-        if user_input_strip == "/model":
-            self._handle_model_selection()
-            return "Model selection complete."
-        if user_input_strip.startswith("/model "):
-            self._select_model(user_input_strip[len("/model "):].strip())
-            return "Model selection complete."
-        if user_input_strip == "/config":
-            self._handle_api_config()
-            return "Configuration updated."
-        if user_input_strip == "/debug":
-            self.debug_enabled = not self.debug_enabled
-            status = "enabled" if self.debug_enabled else "disabled"
-            return f"Debug telemetry {status}."
+            if user_input_strip == "/tokens":
+                text = "".join([m.get("content", "") or "" for m in self.messages])
+                approx_tokens = len(text) // 4
+                console.print(Panel(f"Approximate Session Tokens: [bold cyan]{approx_tokens}[/bold cyan]", border_style="magenta"))
+                return f"Session tokens: ~{approx_tokens}"
+            
+            if user_input_strip == "/tools":
+                tools_table = Table(title="Available Tools", expand=True, border_style="magenta")
+                tools_table.add_column("Name", style="cyan")
+                tools_table.add_column("Description", style="white")
+                for s in self.registry.schemas:
+                    name = s["function"]["name"]
+                    desc = "No description available."
+                    if name in self.registry.tools:
+                        tool_fn = self.registry.tools[name]
+                        desc = tool_fn.__doc__ or "No description available."
+                    tools_table.add_row(escape(name), escape(desc))
+                console.print(Panel(tools_table, border_style="magenta"))
+                return f"Displayed {len(self.registry.schemas)} tools."
+            
+            if user_input_strip == "/context":
+                if not self.imported_context:
+                    console.print("[dim]No imported context found.[/dim]")
+                    return "No imported context."
+                ctx_table = Table(title="Imported Context", expand=True, border_style="magenta")
+                ctx_table.add_column("Source", style="cyan", width=12)
+                ctx_table.add_column("Role", style="magenta", width=10)
+                ctx_table.add_column("Content", style="white")
+                for source, msg in self.imported_context:
+                    content = msg.get("content", "")
+                    display_content = (content[:100] + "...") if len(content) > 100 else content
+                    # Imported content can contain file paths in brackets
+                    # ('[/foo/bar.py]'), which rich would parse as markup.
+                    ctx_table.add_row(source, msg.get("role", "unknown"), escape(display_content))
+                console.print(Panel(ctx_table, border_style="magenta"))
+                return f"Displayed {len(self.imported_context)} imported messages."
+            
+            if user_input_strip == "/provider":
+                self._handle_provider_selection()
+                return "Provider selection complete."
+            if user_input_strip.startswith("/provider "):
+                self._select_provider(user_input_strip[len("/provider "):].strip())
+                return "Provider selection complete."
+            if user_input_strip == "/model":
+                self._handle_model_selection()
+                return "Model selection complete."
+            if user_input_strip.startswith("/model "):
+                self._select_model(user_input_strip[len("/model "):].strip())
+                return "Model selection complete."
+            if user_input_strip == "/config":
+                self._handle_api_config()
+                return "Configuration updated."
+            if user_input_strip == "/debug":
+                self.debug_enabled = not self.debug_enabled
+                status = "enabled" if self.debug_enabled else "disabled"
+                console.print(f"[bold green]✓ Debug telemetry {status}.[/bold green]")
+                return f"Debug telemetry {status}."
+        
         return await self._run_goal(user_input)
 
     async def _run_goal(self, user_input: str):
@@ -632,61 +875,123 @@ class Nano:
             return "Provider API key not configured."
         self.messages.append({"role": "user", "content": user_input})
         
-        while True:
-            if self.debug_enabled:
-                console.print(Panel(Text(json.dumps({
-                    "model": self.model,
-                    "messages": self.messages,
-                    "tools": self.registry.schemas
-                }, indent=2), style="dim"), title="Tool Calls & Telemetry"))
-
-            # Use a type-cast for messages to satisfy the OpenAI SDK's strict type checking
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.messages, # type: ignore
-                tools=[{"type": s["type"], "function": s["function"]} for s in self.registry.schemas],
-                tool_choice="auto",
-                stream=True
-            )
-            full_content = ""
-            tool_calls = []
-            for chunk in stream:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    full_content += delta.content
-                    console.print(delta.content, end="")
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        if tc_delta.index is None: continue
-                        while len(tool_calls) <= tc_delta.index:
-                            tool_calls.append({"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
-                        tc = tool_calls[tc_delta.index]
-                        if tc_delta.id: tc["id"] = tc_delta.id
-                        if tc_delta.function.name: tc["function"]["name"] += tc_delta.function.name
-                        if tc_delta.function.arguments: tc["function"]["arguments"] += tc_delta.function.arguments
-            if full_content:
-                console.print()
-            msg_obj = {"role": "assistant", "content": full_content or None}
-            if tool_calls:
-                msg_obj["tool_calls"] = tool_calls
-            self.messages.append(msg_obj)
-            if tool_calls:
-                tasks = []
-                for tc in tool_calls:
-                    tasks.append(self._execute_tool_wrapper(tc))
-                
-                tool_results = await asyncio.gather(*tasks)
-                
-                for tc, result in zip(tool_calls, tool_results):
-                    self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": tc["function"]["name"], "content": result})
-                
-                if self.session:
-                    self.session.save_session(self.messages)
-                continue 
-            else:
-                if self.session:
-                    self.session.save_session(self.messages)
-                return full_content
+        tools_payload = [{"type": s["type"], "function": s["function"]} for s in self.registry.schemas]
+        tool_rounds = 0
+        try:
+            while True:
+                full_content = ""
+                tool_calls = []
+                md_pending = ""
+                round_started = time.time()
+                if self.debug_enabled:
+                    approx_tokens = sum(len(m.get("content") or "") for m in self.messages) // 4
+                    self._debug_print(f"→ round {tool_rounds + 1} · {escape(self.model)} · {len(self.messages)} msgs (~{approx_tokens} tok) · {len(tools_payload)} tools")
+                # Thinking indicator: animated spinner with a live elapsed-seconds
+                # counter. try/finally guarantees stop() runs even if the request
+                # or stream raises — a leaked live thread would redraw the screen
+                # forever and hide the prompt afterwards.
+                status_indicator = create_thinking_indicator(console)
+                status_indicator.start()
+                try:
+                    # Use a type-cast for messages to satisfy the OpenAI SDK's strict type checking
+                    stream = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=self.messages, # type: ignore
+                        # After too many tool rounds, stop offering tools so the
+                        # model is forced to give a final answer instead of
+                        # looping forever (unbounded token spend / session growth).
+                        tools=tools_payload if tool_rounds < MAX_TOOL_ROUNDS else None,
+                        tool_choice="auto" if tool_rounds < MAX_TOOL_ROUNDS else "none",
+                        stream=True
+                    )
+                    for chunk in stream:
+                        # Some providers send usage-only chunks with empty choices.
+                        if not chunk.choices:
+                            continue
+                        delta = chunk.choices[0].delta
+                        # Stop the spinner on the first visible data (text or tool call).
+                        if status_indicator is not None and (delta.content or delta.tool_calls):
+                            status_indicator.stop()
+                            status_indicator = None
+                        if delta.content:
+                            full_content += delta.content
+                            # Markdown streaming: buffer and render each
+                            # paragraph as soon as it completes, so styled
+                            # output appears while the response is arriving.
+                            md_pending += delta.content
+                            complete, md_pending = _split_complete_markdown(md_pending)
+                            if not complete and len(md_pending) > MAX_MD_PENDING:
+                                complete, md_pending = md_pending, ""
+                            if complete:
+                                _render_markdown_stream(complete)
+                        if delta.tool_calls:
+                            for tc_delta in delta.tool_calls:
+                                if tc_delta.index is None: continue
+                                while len(tool_calls) <= tc_delta.index:
+                                    tool_calls.append({"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+                                tc = tool_calls[tc_delta.index]
+                                if tc_delta.id: tc["id"] = tc_delta.id
+                                if tc_delta.function.name: tc["function"]["name"] += tc_delta.function.name
+                                if tc_delta.function.arguments: tc["function"]["arguments"] += tc_delta.function.arguments
+                finally:
+                    # Always clean up: first token already stopped it (None), and
+                    # this covers empty streams, direct tool calls, and exceptions.
+                    if status_indicator is not None:
+                        status_indicator.stop()
+                # Flush any markdown remainder from the stream.
+                if md_pending:
+                    _render_markdown_stream(md_pending)
+                if tool_calls:
+                    # Some OpenAI-compatible providers never stream tool call IDs;
+                    # synthesize them so the tool messages can reference valid IDs
+                    # (a null tool_call_id makes the next request fail with 400).
+                    for i, tc in enumerate(tool_calls):
+                        if not tc.get("id"):
+                            tc["id"] = f"call_{i}"
+                if self.debug_enabled:
+                    summary = f"{len(full_content)} chars out" if full_content else "no text output"
+                    if tool_calls:
+                        summary += f" · {len(tool_calls)} tool call(s)"
+                    self._debug_print(f"← round done in {time.time() - round_started:.1f}s · {summary}")
+                if full_content:
+                    console.print()
+                msg_obj = {"role": "assistant", "content": full_content or None}
+                if tool_calls:
+                    msg_obj["tool_calls"] = tool_calls
+                self.messages.append(msg_obj)
+                if tool_calls:
+                    tasks = []
+                    for tc in tool_calls:
+                        tasks.append(self._execute_tool_wrapper(tc))
+                    
+                    tool_results = await asyncio.gather(*tasks)
+                    
+                    for tc, result in zip(tool_calls, tool_results):
+                        self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": tc["function"]["name"], "content": result})
+                    
+                    tool_rounds += 1
+                    if tool_rounds >= MAX_TOOL_ROUNDS:
+                        console.print("[yellow]⚠ Tool loop limit reached; asking the model for a final answer.[/yellow]")
+                        self.messages.append({"role": "user", "content": "System: tool iteration limit reached. Answer now with the information you have; do not call more tools."})
+                    
+                    if self.session:
+                        self.session.save_session(self.messages)
+                        self._debug_print(f"session saved ({len(self.messages)} messages)")
+                    continue 
+                else:
+                    if self.session:
+                        self.session.save_session(self.messages)
+                        self._debug_print(f"session saved ({len(self.messages)} messages)")
+                    return full_content
+        except KeyboardInterrupt:
+            # Ctrl+C cancels the turn. First, keep the transcript valid: if we
+            # were interrupted between the assistant's tool calls and their
+            # results, the next request would fail with 400 — synthesize the
+            # missing tool results, save, then let the cancel propagate.
+            self._repair_interrupted_transcript()
+            if self.session:
+                self.session.save_session(self.messages)
+            raise
 
     async def _execute_tool_wrapper(self, tc: Dict[str, Any]) -> str:
         name = tc["function"]["name"]
@@ -694,22 +999,32 @@ class Nano:
         try:
             args = json.loads(args_str)
         except json.JSONDecodeError:
-            args = {}
-            
+            # Never run a tool with silently-dropped arguments: a malformed
+            # or partially streamed JSON blob must fail loudly back to the model.
+            return f"Error: malformed tool arguments for {name}; refusing to execute with missing arguments."
+
         schema = next((s for s in self.registry.schemas if s["function"]["name"] == name), {})
         is_unsafe = schema.get("unsafe", False)
-        
-        if is_unsafe:
-            if self.confirm_callback is None:
-                return "Error: Unsafe tool requires a confirmation callback; execution denied."
-            if not self.confirm_callback(name, args):
-                console.print(Panel(Text("User denied execution.", style="red"), title="Action Cancelled"))
-                return "Error: User denied execution of this tool."
-        
-        return await self._execute_tool(name, args)
+
+        try:
+            if is_unsafe:
+                if self.confirm_callback is None:
+                    return "Error: Unsafe tool requires a confirmation callback; execution denied."
+                if not self.confirm_callback(name, args):
+                    console.print(f"[red]✘ User denied execution of {escape(name)}[/red]")
+                    return "Error: User denied execution of this tool."
+
+            return await self._execute_tool(name, args)
+        except Exception as e:
+            # This MUST return a string, never raise: the caller appends the
+            # result as the tool message, and an unanswered tool call would
+            # corrupt the transcript (every later request would 400).
+            return f"Error during execution of {name}: {e}"
 
     async def _execute_tool(self, name: str, args: dict) -> str:
-        console.print(Panel(Text(f"[bold cyan]Tool Call:[/bold cyan] {name}({args})", style="cyan"), title="Executing Tool"))
+        render_tool_call(name, args)
+        started = time.time()
         result = await self.registry.execute(name, args)
-        console.print(Panel(Text(result, style="green"), title="Tool Result"))
+        self._debug_print(f"… {escape(name)} in {time.time() - started:.2f}s · {len(result)} chars")
+        render_tool_result(result)
         return result

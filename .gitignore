@@ -8,3 +8,7 @@ __pycache__/
 .nano.json
 .nano.json.lock
 .nano-config-*
+
+# Test files: kept locally, never pushed
+test_*.py
+tests/
