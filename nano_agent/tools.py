@@ -62,6 +62,10 @@ class ToolRegistry:
         if not self.tools_dir.exists() or not self.tools_dir.is_dir():
             raise FileNotFoundError(f"CRITICAL: Tools directory not found at {self.tools_dir}")
 
+        # Clear existing tools and schemas to avoid duplicates during reload
+        self.tools = {}
+        self.schemas = []
+
         files = list(self.tools_dir.glob("*.py"))
         files = [f for f in files if f.name != "__init__.py"]
 

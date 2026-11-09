@@ -72,18 +72,15 @@ Manage your agent's state without leaving the chat:
 | Command | Description |
 | :--- | :--- |
 | `/help` | Show this list of available commands |
-| `/provider` or `/provider <name>` | Choose a provider; each retains its own endpoint, model and credential settings |
-| `/model` or `/model <model-id>` | Choose a model for the active provider; discovers installed Ollama models |
-| `/config` | Update the active provider's base URL, key environment-variable name, or model |
-| `/save <name>` | Archive the current conversation as a named session |
+| `/models` | Interactive model picker; switch models or jump to provider manager |
+| `/provider` | Interactive provider manager; switch providers or add new ones |
+| `/status` | View active provider, model, and message count |
+| `/save` | Archive the current conversation as a named session |
 | `/sessions` | List and teleport between past archived sessions |
-| `/context` | View all context imported from other agents (Hermes, OpenCode, etc.) |
 | `/clear` | Wipe the current session history |
-| `/tokens` | Show approximate token usage of the current session |
-| `/tools` | List all available agent tools |
-| `/debug` | Toggle request telemetry (rounds, timing, tokens, session saves) |
 | `/undo` | Restore the workspace from the latest pre-edit snapshot |
 | `/auto` | Toggle auto-approval of file edits and shell commands |
+| `/debug` | Toggle raw request/response debug logs in the terminal |
 
 ### 📁 Session & Context Hub
 `nanoc` acts as a central hub for your AI history:
@@ -101,7 +98,7 @@ Approved destructive calls get a rollback point first: Nano archives the workspa
 ## ⚙️ Optimal Setup
 
 ### Choose a provider and model
-Nano has presets for **OpenRouter**, **OpenAI**, **Ollama** and a **custom** OpenAI-compatible API. Each provider keeps its own model and endpoint in `.nano.json` in the directory where you launch Nano; switching providers restores those settings. Existing single-provider settings are migrated when you first change a provider or model.
+Nano has presets for **OpenRouter**, **OpenAI**, **Ollama** and a **custom** OpenAI-compatible API. Each provider keeps its own model and endpoint in `.nano.json` in the directory where you launch Nano; switching providers restores those settings. When there is no `.nano.json` in the launch directory, Nano falls back to the user-level default at `~/.nano/config.json` (a startup line tells you when that happens); an explicit provider or model change always writes a **local** `.nano.json`, which then takes precedence. Existing single-provider settings are migrated when you first change a provider or model.
 
 When switching to a different endpoint, Nano asks for confirmation: subsequent requests can include the current conversation, system prompt, and tool results. Changing an endpoint also warns that the provider's API key may be sent to that address. Declining leaves your settings unchanged. Provider updates require `.nano.json` to be a regular file, not a symlink; Nano coordinates its own concurrent writers, but not unrelated programs editing that file.
 
@@ -127,7 +124,7 @@ Unsafe tools are **denied by default** in headless mode; pass `--auto` (alias `-
 ### Auto-approve mode
 For hands-free sessions, start with `nanoc --auto` (or `-y`), or type `/auto` mid-session to toggle. While enabled, `write_file`, `edit_file`, and `run_command` execute without confirmation — the status bar shows a persistent `⚡ AUTO` segment so the mode is never forgotten, and `/undo` snapshots are still taken before every destructive call as a rollback net. Auto mode is never stored: it must be an explicit choice each time you launch or toggle it. Sub-agents inherit the parent's mode.
 
-For another OpenAI-compatible endpoint, select `/provider custom`, use `/config` → `url` to set its base URL, and use `/config` → `key` to specify the **name** of an environment variable containing its API key (default `CUSTOM_API_KEY`). Set that variable before starting Nano, then enter `/model <exact-model-id>`. The `/provider` and `/model` commands also offer interactive menus when run without arguments.
+For another OpenAI-compatible endpoint, select `/provider`, then use the `/a` command to add a new custom provider with its base URL and API key. Set that variable before starting Nano, then enter `/model <exact-model-id>`. The `/provider` and `/models` commands provide full interactive menus for configuration.
 
 ### Project-Specific Personality
 Drop a `.nano.json` file into any project folder to define a project-specific brain:

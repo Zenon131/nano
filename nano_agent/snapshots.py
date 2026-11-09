@@ -2,7 +2,7 @@ import hashlib
 import tarfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Where all Nano state lives (matches SessionManager's ~/.nano convention).
 SNAPSHOT_HOME = Path("~/.nano/snapshots").expanduser()
@@ -32,6 +32,14 @@ MAX_KEEP = 10
 # unsafe calls inside a single tool round-trip are one logical edit.
 MIN_INTERVAL_SECONDS = 5.0
 
+# A pre-tool snapshot must never stall tool approval for minutes. Workspaces
+# beyond either cap — or whose scan cannot even finish within the deadline —
+# are skipped with a visible warning instead of being silently archived at
+# great cost (an alphabetical *partial* archive is useless for undo anyway).
+MAX_WORKSPACE_BYTES = 1 * 1024 * 1024 * 1024   # 1 GiB
+MAX_WORKSPACE_FILES = 50_000
+SCAN_DEADLINE_SECONDS = 10.0
+
 
 class SnapshotManager:
     """Creates and restores workspace snapshots for the /undo command.
@@ -46,23 +54,42 @@ class SnapshotManager:
         key = f"{self.root.name}_{hashlib.sha1(str(self.root).encode()).hexdigest()[:8]}"
         self.dir = SNAPSHOT_HOME / key
         self._last_auto_time = 0.0
+        # Human-readable reason when snapshot() skipped an oversized
+        # workspace (None otherwise) — callers surface it as a warning.
+        self.last_skip_reason: Optional[str] = None
 
     def snapshot(self, label: str = "manual", force: bool = False) -> Optional[Path]:
         """Archive the workspace now.
 
         Returns the archive path, or None when nothing was archived:
-        a skipped rate limit, an unreadable workspace, or an I/O error.
-        `force=True` bypasses the rate limit (used for tests and /undo prep).
+        a skipped rate limit, an unreadable workspace, an I/O error, or a
+        workspace too large to snapshot safely (last_skip_reason explains
+        that last case). `force=True` bypasses the rate limit (used for
+        tests and /undo prep).
         """
+        self.last_skip_reason = None
         if not force and time.time() - self._last_auto_time < MIN_INTERVAL_SECONDS:
             return None
-        candidates = self._candidate_files()
-        if not candidates:
+        candidates, scan_completed = self._candidate_files()
+        if not candidates and scan_completed:
+            return None
+        total_bytes = sum(size for _, _, size in candidates)
+        if (not scan_completed
+                or len(candidates) > MAX_WORKSPACE_FILES
+                or total_bytes > MAX_WORKSPACE_BYTES):
+            if not scan_completed:
+                detail = (f"scan aborted after {SCAN_DEADLINE_SECONDS:.0f}s at "
+                          f"{len(candidates)}+ files, ~{total_bytes / 1024 / 1024:.0f} MB")
+            else:
+                detail = f"{len(candidates)} files, {total_bytes / 1024 / 1024:.0f} MB"
+            self.last_skip_reason = f"workspace too large to snapshot ({detail})"
             return None
         archive_path = self.dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{label}.tar.gz"
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
-            with tarfile.open(archive_path, "w:gz") as tar:
+            # compresslevel 1: a rollback point does not need max compression,
+            # and level 9 turns a few-second archive into minutes on big trees.
+            with tarfile.open(archive_path, "w:gz", compresslevel=1) as tar:
                 budget = MAX_ARCHIVE_BYTES
                 for path, rel, size in candidates[:MAX_FILES]:
                     if size > budget:
@@ -123,11 +150,19 @@ class SnapshotManager:
         available = self.items()
         return self.restore(available[0]) if available else None
 
-    def _candidate_files(self) -> List:
+    def _candidate_files(self) -> Tuple[List, bool]:
         """Regular, readable workspace files (path, relative name, size),
-        excluding caches/dependencies and sorted for a deterministic archive."""
+        excluding caches/dependencies and sorted for a deterministic archive.
+
+        The scan honors SCAN_DEADLINE_SECONDS and returns early with
+        (partial_candidates, False) when the workspace is so large that a
+        pre-tool snapshot would stall tool approval for minutes.
+        """
         candidates = []
+        deadline = time.monotonic() + SCAN_DEADLINE_SECONDS
         for path in self.root.rglob("*"):
+            if time.monotonic() > deadline:
+                return candidates, False
             try:
                 if path.is_symlink() or not path.is_file():
                     continue
@@ -140,7 +175,7 @@ class SnapshotManager:
                 candidates.append((path, rel, path.stat().st_size))
             except OSError:
                 continue
-        return sorted(candidates, key=lambda entry: str(entry[1]))
+        return sorted(candidates, key=lambda entry: str(entry[1])), True
 
     def _prune(self):
         archives = sorted(self.dir.glob("*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True)

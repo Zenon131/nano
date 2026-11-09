@@ -1,410 +1,94 @@
-import os
+import asyncio
+import functools
+import inspect
 import json
-import copy
+import os
 import re
 import time
-import glob
-import sqlite3
-import tempfile
-from contextlib import contextmanager
-import requests
-import asyncio
+from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
-from typing import List, Dict, Any, Optional, Callable, Tuple
-from openai import OpenAI
+from typing import Any, Callable, Dict, List, Optional, Union
+
+from openai import AsyncOpenAI
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
-from rich.text import Text
 from rich.table import Table
 from rich.prompt import Prompt, Confirm
-from nano_agent.ui import (
-    render_tool_call,
-    render_tool_result,
-    create_thinking_indicator
-)
-from nano_agent.snapshots import SnapshotManager
-from rich.markdown import Markdown
-from nano_agent.tools import ToolRegistry, generate_tool_schema
-from nano_agent.providers import ProviderSettings, infer_legacy_provider
-from dotenv import load_dotenv
 
-load_dotenv()
+from nano_agent.providers import ProviderSettings, OpenAICompatibleProvider
+
 console = Console()
 
-# Safety cap on tool-call rounds per user message: beyond this, tools are
-# withheld so the model must produce a final answer instead of looping.
-MAX_TOOL_ROUNDS = 25
+class ToolRegistry:
+    def __init__(self, tools_dir: Optional[str] = None):
+        self.tools_dir = Path(tools_dir) if tools_dir else Path("tools")
+        self.tools: Dict[str, Callable] = {}
+        self.schemas: List[Dict[str, Any]] = []
+        self.unsafe_tools = set()
 
-# Force-flush threshold for markdown streaming: paragraphs render as they
-# complete, but a single very long paragraph shouldn't stay invisible forever.
-MAX_MD_PENDING = 1500
+    def load_tools(self):
+        self.tools.clear()
+        self.schemas.clear()
+        if not self.tools_dir.exists():
+            self.tools_dir.mkdir(parents=True, exist_ok=True)
+            return
 
-
-def _split_complete_markdown(buffer: str) -> Tuple[str, str]:
-    """Split streamed text into (renderable, pending) at the last paragraph
-    break that is outside a code fence, so incomplete blocks stay pending."""
-    fence = False
-    safe_end = 0
-    pos = 0
-    for line in buffer.split("\n"):
-        if line.strip().startswith("```"):
-            fence = not fence
-        pos += len(line) + 1
-        # Only paragraph breaks OUTSIDE code fences are safe to render at.
-        if not fence and line == "":
-            safe_end = pos
-    return buffer[:safe_end], buffer[safe_end:]
-
-
-def _render_markdown_stream(text: str):
-    """Render one chunk of streamed markdown; falls back to plain text if
-    the markdown renderer chokes on malformed input."""
-    try:
-        console.print(Markdown(text))
-    except Exception:
-        console.print(text, end="", markup=False, highlight=False)
-
-
-# AGENTS.md is the emerging cross-agent convention for per-project agent
-# instructions; honoring it lets Nano follow the same rules file as Claude
-# Code and OpenCode when working in a shared repository.
-AGENTS_FILENAME = "AGENTS.md"
-# Long instruction files still must not dominate the prompt.
-AGENTS_MAX_CHARS = 8000
-
-
-def _load_agents_instructions():
-    """Find and read AGENTS.md from the working directory or nearest parent.
-
-    Returns (path, text) or None when no file exists anywhere up the tree.
-    """
-    for directory in [Path.cwd(), *Path.cwd().parents]:
-        candidate = directory / AGENTS_FILENAME
-        if candidate.is_file():
+        for file in self.tools_dir.glob("*.py"):
+            if file.name == "__init__.py": continue
+            module_name = f"tools.{file.stem}"
             try:
-                text = candidate.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            return candidate, text[:AGENTS_MAX_CHARS]
-    return None
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(module_name, file)
+                if spec is None: continue
+                module = importlib.util.module_from_spec(spec)
+                if spec.loader: spec.loader.exec_module(module)
+                for name, obj in inspect.getmembers(module):
+                    if (inspect.iscoroutinefunction(obj) or inspect.isfunction(obj)) and not name.startswith("_"):
+                        self.tools[name] = obj
+                        self.schemas.append(self.generate_tool_schema(obj))
+            except Exception as e:
+                console.print(f"[red]Failed to load tool {file.name}: {e}[/red]")
 
+    def generate_tool_schema(self, func: Callable) -> Dict[str, Any]:
+        sig = inspect.signature(func)
+        params = {n: {"type": "string"} for n in sig.parameters}
+        return {
+            "type": "function",
+            "function": {
+                "name": func.__name__,
+                "description": func.__doc__ or "No description provided.",
+                "parameters": {
+                    "type": "object", 
+                    "properties": params, 
+                    "required": [n for n, p in sig.parameters.items() if p.default == inspect.Parameter.empty]
+                },
+            },
+            "unsafe": func.__name__ in self.unsafe_tools
+        }
 
-@contextmanager
-def _provider_config_lock():
-    """Lock a stable sidecar inode across Nano processes and atomic replaces."""
-    fd = os.open(".nano.json.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        if os.name == "nt":
-            import msvcrt
-            # Windows can lock a byte beyond EOF; keep the sidecar in place.
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX)
+    async def execute(self, name: str, args: Dict[str, Any]) -> str:
+        if name not in self.tools: return f"Error: Tool {name} not found."
+        func = self.tools[name]
         try:
-            yield
-        finally:
-            if os.name == "nt":
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+            # Pass self (the registry) if the tool expects it, or just args
+            # Standard Nano tools usually take (registry, **args)
+            return await func(self, **args) if inspect.iscoroutinefunction(func) else func(self, **args)
+        except Exception as e: return f"Tool execution error: {str(e)}"
 
+class SnapshotManager:
+    def __init__(self, root_dir: str):
+        self.root_dir = Path(root_dir)
+        self.history: List[Dict[str, Any]] = []
 
-def _provider_config_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
-    fields = ("active_provider", "providers", "model", "base_url", "api_key", "manual_models")
-    return {key: copy.deepcopy(config[key]) for key in fields if key in config}
+    def snapshot(self, label: str):
+        state = {str(f): f.read_text() for f in self.root_dir.rglob("*.py")}
+        self.history.insert(0, {"time": time.time(), "label": label, "state": state})
+        self.history = self.history[:10]
 
-
-class ContextImporter:
-    """Discovers and imports recent conversation history from other terminal
-    agents (OpenCode, Claude Code, Hermes, OpenClaw).
-
-    Instead of a naive sweep of every JSON file, this reads each agent's
-    *native* storage format: SQLite databases for Hermes and OpenCode, and
-    JSONL session transcripts for Claude Code. Only real conversation turns
-    (user/assistant with non-empty text) are imported, capped to the most
-    recent messages per source, so startup stays fast and context stays clean.
-    """
-
-    # Import recent context, not full histories. Kept somewhat larger than
-    # the digest needs so /context can still browse more history.
-    MAX_MESSAGES_PER_SOURCE = 100
-    # Guards for transcript sweeps on machines with very large histories.
-    MAX_FILES_PER_SOURCE = 50
-    MAX_TRANSCRIPT_LINES = 5000
-
-    # SQLite-backed agents: candidate database paths (glob patterns allowed).
-    SQLITE_SOURCES = {
-        "hermes": [
-            "~/.hermes/state.db",
-            "~/.hermes/profiles/*/state.db",
-        ],
-        "opencode": [
-            "~/.local/share/opencode/opencode.db",
-            "~/Library/Application Support/opencode/opencode.db",
-            "~/AppData/Local/opencode/opencode.db",
-            "~/AppData/Roaming/opencode/opencode.db",
-        ],
-    }
-
-    # Transcript-file agents: candidate dirs and file patterns.
-    FILE_SOURCES = {
-        "claude_code": (
-            ["~/.claude/projects", "~/.claude/sessions"],
-            ["*.jsonl"],
-        ),
-        "openclaw": (
-            ["~/.openclaw", "~/.config/openclaw", "~/Library/Application Support/openclaw"],
-            ["*.jsonl", "*session*.json", "*history*.json", "*conversation*.json"],
-        ),
-    }
-
-    @staticmethod
-    def _valid_message(msg: Any) -> bool:
-        """A usable conversation turn: user/assistant role with real text content."""
-        if not isinstance(msg, dict):
-            return False
-        role = msg.get("role")
-        content = msg.get("content")
-        return role in ("user", "assistant") and isinstance(content, str) and bool(content.strip())
-
-    def _import_hermes_db(self, path: Path) -> List[Dict]:
-        """Hermes stores conversations in SQLite (messages table with role/content)."""
-        try:
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-            try:
-                cur = conn.execute(
-                    "SELECT role, content FROM messages "
-                    "WHERE role IN ('user','assistant') AND content IS NOT NULL "
-                    "AND length(content) > 0 ORDER BY timestamp DESC LIMIT ?",
-                    (self.MAX_MESSAGES_PER_SOURCE,),
-                )
-                rows = cur.fetchall()
-            finally:
-                conn.close()
-        except Exception:
-            return []
-        # Rows are newest-first; reverse into chronological order.
-        return [{"role": role, "content": content} for role, content in reversed(rows)]
-
-    def _import_opencode_db(self, path: Path) -> List[Dict]:
-        """OpenCode stores sessions in SQLite (message + part tables with JSON data)."""
-        try:
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-            try:
-                cur = conn.execute(
-                    "SELECT m.id, m.data, p.data FROM message m "
-                    "JOIN part p ON p.message_id = m.id "
-                    "WHERE json_extract(p.data, '$.type') = 'text' "
-                    "ORDER BY m.time_created DESC, p.time_created LIMIT ?",
-                    (self.MAX_MESSAGES_PER_SOURCE * 4,),
-                )
-                rows = cur.fetchall()
-            finally:
-                conn.close()
-        except Exception:
-            return []
-
-        # Group text parts by message id (rows come newest-first).
-        grouped = {}
-        order = []
-        for msg_id, msg_data, part_data in rows:
-            try:
-                role = json.loads(msg_data).get("role")
-                text = json.loads(part_data).get("text")
-            except Exception:
-                continue
-            if role not in ("user", "assistant") or not isinstance(text, str) or not text.strip():
-                continue
-            if msg_id not in grouped:
-                grouped[msg_id] = {"role": role, "parts": []}
-                order.append(msg_id)
-            grouped[msg_id]["parts"].append(text)
-
-        messages = [
-            {"role": grouped[mid]["role"], "content": "\n".join(grouped[mid]["parts"])}
-            for mid in reversed(order)
-        ]
-        return messages[-self.MAX_MESSAGES_PER_SOURCE:]
-
-    @classmethod
-    def _extract_turns(cls, entry: Any) -> List[Dict]:
-        """Extract user/assistant turns from a Claude Code style transcript entry.
-
-        Handles both flat entries and Claude's nested 'message' wrapper, with
-        content as either a plain string or a list of content blocks.
-        """
-        if not isinstance(entry, dict):
-            return []
-        turns = []
-        # Some formats nest turn lists under a 'messages' key.
-        if isinstance(entry.get("messages"), list):
-            for sub in entry["messages"]:
-                turns.extend(cls._extract_turns(sub))
-            return turns
-        inner = entry.get("message") if isinstance(entry.get("message"), dict) else entry
-        role = inner.get("role") or entry.get("type")
-        content = inner.get("content")
-        if content is None and isinstance(inner.get("text"), str):
-            content = inner["text"]
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and isinstance(block.get("text"), str):
-                    parts.append(block["text"])
-                elif isinstance(block, str):
-                    parts.append(block)
-            content = "\n".join(parts)
-        turn = {"role": role, "content": content}
-        return [turn] if cls._valid_message(turn) else []
-
-    def _read_json_safe(self, path: Path) -> Any:
-        """Safely read and parse a JSON file, returning None on any failure."""
-        try:
-            if path.stat().st_size > 10 * 1024 * 1024:  # 10MB limit
-                return None
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-
-    def _import_transcript_file(self, path: Path) -> List[Dict]:
-        """Parse a JSONL transcript (or JSON array of turns) into messages."""
-        messages = []
-        if path.suffix == ".json":
-            data = self._read_json_safe(path)
-            entries = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
-            for entry in entries:
-                messages.extend(self._extract_turns(entry))
-        else:  # JSONL and friends: one JSON object per line
-            try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    for i, line in enumerate(f):
-                        if i >= self.MAX_TRANSCRIPT_LINES:
-                            break
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            messages.extend(self._extract_turns(json.loads(line)))
-                        except Exception:
-                            continue
-            except Exception:
-                return []
-        return messages[-self.MAX_MESSAGES_PER_SOURCE:]
-
-    def _scan_file_source(self, dirs: List[str], patterns: List[str]) -> List[Dict]:
-        """Find the newest transcript files under candidate dirs and parse them."""
-        candidates = set()
-        for dir_pattern in dirs:
-            base = Path(dir_pattern).expanduser()
-            if not base.is_dir():
-                continue
-            for pattern in patterns:
-                try:
-                    candidates.update(base.rglob(pattern))
-                except Exception:
-                    continue
-        # Prefer the most recently modified transcripts.
-        def mtime(p):
-            try:
-                return p.stat().st_mtime
-            except Exception:
-                return 0
-        files = sorted(candidates, key=mtime, reverse=True)[:self.MAX_FILES_PER_SOURCE]
-
-        collected = []
-        for path in files:
-            collected.extend(self._import_transcript_file(path))
-        return collected[-self.MAX_MESSAGES_PER_SOURCE:]
-
-    def discover_and_import(self) -> List[Tuple[str, Dict]]:
-        """Return (source_agent, message) tuples for recently used agent histories."""
-        imported: List[Tuple[str, Dict]] = []
-        seen = set()
-        per_source: Dict[str, int] = {}
-
-        def add(agent: str, messages: List[Dict]) -> None:
-            for msg in messages:
-                if not self._valid_message(msg):
-                    continue
-                if per_source.get(agent, 0) >= self.MAX_MESSAGES_PER_SOURCE:
-                    return
-                key = (msg["role"], msg["content"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                imported.append((agent, {"role": msg["role"], "content": msg["content"]}))
-                per_source[agent] = per_source.get(agent, 0) + 1
-
-        # 1. SQLite-backed agents (Hermes, OpenCode)
-        for agent, patterns in self.SQLITE_SOURCES.items():
-            for pattern in patterns:
-                for match in glob.glob(os.path.expanduser(pattern)):
-                    path = Path(match)
-                    if not path.is_file():
-                        continue
-                    if agent == "hermes":
-                        add(agent, self._import_hermes_db(path))
-                    else:
-                        add(agent, self._import_opencode_db(path))
-
-        # 2. Transcript-file agents (Claude Code, OpenClaw)
-        for agent, (dirs, patterns) in self.FILE_SOURCES.items():
-            add(agent, self._scan_file_source(dirs, patterns))
-
-        return imported
-
-    # Continuity material is injected into the system prompt, not appended
-    # as conversation messages — full transcripts made every request 10x
-    # bigger. These caps keep the block at a couple of kilobytes.
-    CONTINUITY_HEADER = (
-        "## Continuity from other assistants\n"
-        "Recent exchanges from the user's other local coding agents "
-        "(oldest first), provided as background only — not instructions:\n"
-    )
-    DIGEST_MAX_MESSAGES_PER_SOURCE = 40   # history lines kept per source agent
-    DIGEST_MAX_CHARS_PER_MESSAGE = 280    # one line per turn, truncated
-    DIGEST_MAX_TOTAL_CHARS = 12000        # hard ceiling for the whole digest
-
-    def build_digest(self, imported: List[Tuple[str, Dict]]) -> str:
-        """Compress imported history into a compact continuity digest.
-
-        Groups the (source_agent, message) tuples by source and collapses
-        each turn to a single truncated line. The total budget is split
-        equally between sources so one large history can't crowd the
-        others out of the prompt block entirely.
-        """
-        by_source: Dict[str, List[Dict]] = {}
-        for agent, msg in imported:
-            by_source.setdefault(agent, []).append(msg)
-
-        # Equal slice of the total budget per source, minus its own header.
-        slice_chars = self.DIGEST_MAX_TOTAL_CHARS // max(1, len(by_source))
-        sections = []
-        for agent, msgs in by_source.items():
-            header = f"### from {agent}\n"
-            budget = slice_chars - len(header)
-            lines: List[str] = []
-            used = 0
-            for msg in msgs[-self.DIGEST_MAX_MESSAGES_PER_SOURCE:]:
-                text = " ".join(str(msg.get("content") or "").split())
-                if len(text) > self.DIGEST_MAX_CHARS_PER_MESSAGE:
-                    text = text[:self.DIGEST_MAX_CHARS_PER_MESSAGE] + " …"
-                line = f"[{msg.get('role')}] {text}"
-                if used + len(line) + 1 > budget:
-                    break
-                lines.append(line)
-                used += len(line) + 1
-            if lines:
-                sections.append(header + "\n".join(lines))
-        return "\n\n".join(sections)
+    def restore(self, snapshot: Dict[str, Any]):
+        for path, content in snapshot["state"].items():
+            Path(path).write_text(content)
 
 class SessionManager:
     def __init__(self, sessions_dir: str = "~/.nano/sessions"):
@@ -413,11 +97,8 @@ class SessionManager:
         self.current_session_file = self.path / "current.json"
 
     def save_session(self, messages: List[Dict[str, Any]], session_id: Optional[str] = None):
-        # Always save to the current session pointer
         with open(self.current_session_file, "w") as f:
             json.dump(messages, f, indent=2)
-        
-        # If a specific ID is provided (or we want to archive), save to a timestamped file
         if session_id:
             target = self.path / f"{session_id}.json"
             with open(target, "w") as f:
@@ -425,29 +106,19 @@ class SessionManager:
 
     def load_session(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         target = self.path / f"{session_id}.json" if session_id else self.current_session_file
-        if not target.exists():
-            return []
+        if not target.exists(): return []
         try:
-            with open(target, "r") as f:
-                return json.load(f)
-        except Exception:
-            return []
+            with open(target, "r") as f: return json.load(f)
+        except: return []
 
-    def list_sessions(self) -> List[Dict[str, Any]]:
+    def list_sessions(self):
         sessions = []
         for f in self.path.glob("*.json"):
             if f.name == "current.json": continue
             try:
-                # Use file mtime as a proxy for session date
                 mtime = f.stat().st_mtime
-                sessions.append({
-                    "id": f.stem, 
-                    "date": mtime, 
-                    "path": str(f)
-                })
-            except Exception:
-                continue
-        # Sort by newest first
+                sessions.append({"id": f.stem, "date": mtime, "path": str(f)})
+            except: continue
         return sorted(sessions, key=lambda x: x["date"], reverse=True)
 
     def clear_session(self):
@@ -455,747 +126,222 @@ class SessionManager:
             self.current_session_file.unlink()
 
 class Nano:
-    def __init__(self, tools_dir: Optional[str] = None, model: str = "gpt-4o",
-                 confirm_callback: Optional[Callable[[str, Dict], bool]] = None,
-                 is_subagent: bool = False, provider_config: Optional[Dict[str, Any]] = None,
-                 interactive: bool = True, auto_approve: bool = False):
-
-        # Must be set before _register_core_tools() so sub-agents don't get
-        # the spawn_sub_agent tool registered/advertised at all.
-        self.is_subagent = is_subagent
-        # Headless runs can't answer interactive dialogs (provider pickers,
-        # undo confirmation); they get a clean refusal instead of hanging.
+    def __init__(self, tools_dir: Optional[str] = None, confirm_callback: Optional[Callable] = None, interactive=True, auto_approve=False):
         self.interactive = interactive
-        # Auto-approve mode ("yolo"): unsafe tools run without confirmation.
-        # Deliberately NOT persisted — it must always be an explicit, visible
-        # choice (CLI flag or /auto), and the status bar shows it while on.
         self.auto_approve = auto_approve
-        config = self._load_config()
-        self._provider_snapshot = _provider_config_snapshot(config)
-        self.provider_settings = ProviderSettings(provider_config if provider_config is not None else config, default_model=model)
-        self._apply_provider()
-
-        project_prompt = config.get("system_prompt", "You are Nano, a transparent terminal AI agent.")
-
-        self.system_prompt = (
-            f"{project_prompt}\n\n"
-            "IDENTITY: You are a Terminal AI Agent. You do NOT chat about your limitations. "
-            "You execute tasks using tools. If a tool exists for a task, you MUST use it. "
-            "NEVER ask the user to run a command and paste the output if you have a tool for it.\n\n"
-            "TOOL HIERARCHY:\n"
-            "1. Use basic tools (filesystem, shell) for all direct requests.\n"
-            "2. Use spawn_sub_agent ONLY for multi-step complex reasoning.\n"
-            "3. You are strictly forbidden from telling the user you cannot see the filesystem."
-        )
-
-        # Honor a repository AGENTS.md exactly like other coding agents do.
-        # Sub-agents get a purpose-built prompt instead, so skip it there.
-        agents_source = None if is_subagent else _load_agents_instructions()
-        if agents_source:
-            agents_path, agents_text = agents_source
-            self.system_prompt += (
-                f"\n\nPROJECT INSTRUCTIONS (from {AGENTS_FILENAME}):\n"
-                f"{agents_text}\n"
-                "The instructions above are project rules; follow them when they "
-                "do not conflict with tool safety."
-            )
-
-        
-        package_root = Path(__file__).parent.parent
-        if tools_dir is None:
-            tools_dir = str(package_root / "tools")
-        
-        config_tools_dir = config.get("tools_dir")
-        if config_tools_dir:
-            config_path = Path(config_tools_dir)
-            if not config_path.is_absolute():
-                final_tools_dir = str(package_root / config_path)
-            else:
-                final_tools_dir = config_tools_dir
-        else:
-            final_tools_dir = tools_dir
-        
-        self.registry = ToolRegistry(final_tools_dir)
-        self.registry.load_tools()
-        self._register_core_tools()
-        
-        self.registry.schemas.sort(key=lambda x: x.get("priority", 1))
-        
-        self.debug_enabled = False
-        self.session = None if is_subagent else SessionManager()
-        # Restore points for /undo, keyed by working directory. Sub-agents
-        # share the same workspace, so they snapshot into the same store.
-        self.snapshots = SnapshotManager()
-
-        # A delegated agent gets only its explicit goal, never the user's saved
-        # or automatically discovered conversations.
-        importer = ContextImporter()
-        foreign_context = importer.discover_and_import() if not is_subagent else []
-        self.imported_context = foreign_context
-
-        self.messages = self.session.load_session() if self.session is not None else []
         self.confirm_callback = confirm_callback
+        self.registry = ToolRegistry(tools_dir)
+        self.registry.load_tools()
+        
+        config = self._load_config()
+        self.settings = ProviderSettings(config)
+        self.provider = OpenAICompatibleProvider(self.settings)
+        self.provider_name = self.settings.active
+        self.model = self.settings.current["model"]
+        
+        self.messages = []
+        self.snapshots = SnapshotManager(".")
+        self.session = SessionManager()
+        self.prompt_session: Any = None
+        self.debug = False
+        self._register_core_tools()
 
-        if foreign_context:
-            digest = importer.build_digest(foreign_context)
-            if not self.messages:
-                # Fresh start: inject the distilled history once, inside the
-                # system prompt. It is then saved and resumes with the session.
-                console.print(Panel(Text(
-                    f"Distilled {len(foreign_context)} messages from other agents "
-                    f"into a {len(digest)}-char continuity digest.",
-                    style="dim"), title="Context Import"))
-            self._ensure_system_prompt(
-                "\n\n" + ContextImporter.CONTINUITY_HEADER + digest)
-        else:
-            self._ensure_system_prompt()
-
-        if agents_source:
-            console.print(f"[dim]Loaded project instructions from {escape(str(agents_path))}[/dim]")
-
-    def _ensure_system_prompt(self, extra: str = ""):
-        """Make messages[0] the current system prompt (+ optional block), without
-        dropping a real first turn: sessions saved by Nano always begin with
-        the system message, so it is replaced; anything else is kept and the
-        prompt is inserted in front."""
-        content = self.system_prompt + extra
-        system_msg = {"role": "system", "content": content}
-        if self.messages and self.messages[0].get("role") == "system":
-            self.messages[0] = system_msg
-        elif self.messages:
-            self.messages.insert(0, system_msg)
-        else:
-            self.messages = [system_msg]
-
-    def _load_config(self) -> Dict[str, Any]:
-        config_path = Path(".nano.json")
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-        except FileNotFoundError:
-            return {}
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise ValueError("Cannot read Nano configuration; fix .nano.json before continuing. No settings were changed.") from error
-        if not isinstance(config, dict):
-            raise ValueError("Nano configuration must be a JSON object. No settings were changed.")
-        return config
-
-    def _apply_provider(self):
-        profile = self.provider_settings.current
-        self.provider = self.provider_settings.active
-        self.model = profile.get("model") or ""
-        self.base_url = profile.get("base_url") or None
-        self.api_key = self.provider_settings.credential()
-        # A placeholder lets users configure a provider before its key is set.
-        # run() refuses to send requests while the key is missing.
-        self.client = OpenAI(api_key=self.api_key or "not-configured", base_url=self.base_url)
-
-    def _save_provider_settings(self):
-        def reject_symlink():
-            if Path(".nano.json").is_symlink():
-                raise ValueError("The .nano.json config is a symlink; use a regular file before changing provider settings. No settings were changed.")
-
-        # Lock a sidecar rather than the config inode, which is replaced below.
-        # Compare while holding the lock so two processes cannot both commit
-        # from the same stale snapshot.
-        with _provider_config_lock():
-            reject_symlink()
-            config = self._load_config()
-            if _provider_config_snapshot(config) != self._provider_snapshot:
-                raise ValueError("Provider settings changed in another Nano instance; restart Nano before changing them. No settings were changed.")
-            # Migrate legacy fields only when a provider setting is changed.
-            for field in ("model", "base_url", "api_key", "manual_models"):
-                config.pop(field, None)
-            config.update(self.provider_settings.serialized())
-            temporary_path = None
+    def _load_config(self):
+        config_path = Path.home() / ".nano.json"
+        if config_path.exists():
             try:
-                with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=".", prefix=".nano-config-", delete=False) as f:
-                    temporary_path = Path(f.name)
-                    json.dump(config, f, indent=2)
-                # The sidecar serializes Nano writers only; other filesystem
-                # writers can still race this check and the atomic replace.
-                reject_symlink()
-                os.replace(temporary_path, ".nano.json")
-                self._provider_snapshot = _provider_config_snapshot(config)
-            finally:
-                if temporary_path is not None and temporary_path.exists():
-                    temporary_path.unlink()
-
-    def _commit_provider_settings(self, candidate: ProviderSettings):
-        previous = self.provider_settings
-        self.provider_settings = candidate
-        try:
-            self._apply_provider()
-            self._save_provider_settings()
-        except Exception:
-            self.provider_settings = previous
-            self._apply_provider()
-            raise
-
-    def _select_provider(self, name: str):
-        if name not in self.provider_settings.profiles:
-            console.print(f"[red]Unknown provider: {name}. Use /provider to see options.[/red]")
-            return
-        target_url = self.provider_settings.profiles[name].get("base_url")
-        if target_url and target_url != self.base_url:
-            host = urlparse(target_url).hostname or "unknown host"
-            console.print("[yellow]Future requests may send the current conversation, system prompt and tool results to the new endpoint.[/yellow]")
-            if not Confirm.ask(f"Switch to {name} on {host}?", default=False):
-                console.print("[dim]Provider switch cancelled.[/dim]")
-                return
-        candidate = copy.deepcopy(self.provider_settings)
-        candidate.active = name
-        self._commit_provider_settings(candidate)
-        console.print(f"[green]Provider: {name}[/green] — endpoint: {self.base_url or '(not configured)'}")
-        if not self.model:
-            console.print("[yellow]Choose a model with /model or /model <model-id>.[/yellow]")
-        if not self.api_key:
-            env_name = self.provider_settings.current.get("api_key_env")
-            console.print(f"[yellow]API key not set. Set {env_name or 'an API key environment variable'} before starting Nano.[/yellow]")
-
-    def _handle_provider_selection(self):
-        table = Table(title="Providers", expand=True, border_style="magenta")
-        table.add_column("ID", style="cyan", no_wrap=True)
-        table.add_column("Provider")
-        table.add_column("Endpoint")
-        names = list(self.provider_settings.profiles)
-        for index, name in enumerate(names, 1):
-            profile = self.provider_settings.profiles[name]
-            marker = " (active)" if name == self.provider else ""
-            table.add_row(str(index), f"{name}{marker}", str(profile.get("base_url") or "(not configured)"))
-        console.print(Panel(table, border_style="magenta"))
-        choice = Prompt.ask("Provider number or name (Enter to cancel)", default="")
-        if not choice:
-            return
-        if choice.isdigit():
-            index = int(choice) - 1
-            if not 0 <= index < len(names):
-                console.print("[red]Invalid provider selection.[/red]")
-                return
-            choice = names[index]
-        self._select_provider(choice)
-
-    def _get_ollama_models(self) -> List[str]:
-        if self.provider != "ollama" or not self.base_url:
-            return []
-        try:
-            base = self.base_url.rstrip("/")
-            if base.endswith("/v1"):
-                base = base[:-3]
-            response = requests.get(base + "/api/tags", timeout=2)
-            response.raise_for_status()
-            payload = response.json()
-            models = payload.get("models") if isinstance(payload, dict) else None
-            if not isinstance(models, list):
-                return []
-            return [m["name"] for m in models if isinstance(m, dict) and isinstance(m.get("name"), str)]
-        except (requests.RequestException, ValueError, KeyError, TypeError):
-            return []
-
-    def _select_model(self, name: str):
-        if not name:
-            console.print("[red]Provide a model ID: /model <model-id>[/red]")
-            return
-        candidate = copy.deepcopy(self.provider_settings)
-        profile = candidate.current
-        profile["model"] = name
-        manual = profile.setdefault("manual_models", [])
-        if name not in manual:
-            manual.append(name)
-        self._commit_provider_settings(candidate)
-        console.print(f"[green]Model: {name} ({self.provider})[/green]")
-
-    def _handle_model_selection(self):
-        profile = self.provider_settings.current
-        models = list(dict.fromkeys(
-            self._get_ollama_models() + profile.get("manual_models", []) + ([self.model] if self.model else [])
-        ))
-        table = Table(title=f"Models — {self.provider}", expand=True, border_style="magenta")
-        table.add_column("ID", style="cyan", no_wrap=True)
-        table.add_column("Model")
-        for index, name in enumerate(models, 1):
-            marker = " (active)" if name == self.model else ""
-            table.add_row(str(index), name + marker)
-        console.print(Panel(table, border_style="magenta"))
-        console.print("Enter a listed number or an exact model ID; Enter cancels.")
-        choice = Prompt.ask("Model", default="")
-        if not choice:
-            return
-        if choice.isdigit():
-            index = int(choice) - 1
-            if not 0 <= index < len(models):
-                console.print("[red]Invalid model selection.[/red]")
-                return
-            choice = models[index]
-        self._select_model(choice)
-
-    def _handle_api_config(self):
-        console.print(Panel(f"API Configuration — {self.provider}", style="magenta"))
-        action = Prompt.ask("What would you like to update?", choices=["url", "key", "model", "back"], default="url")
-        candidate = copy.deepcopy(self.provider_settings)
-        profile = candidate.current
-        if action == "url":
-            new_url = Prompt.ask("Base API URL", default=str(self.base_url or ""))
-            try:
-                parsed = urlparse(new_url)
-                _ = parsed.port  # Access validates numeric range and syntax.
-            except ValueError:
-                console.print("[red]Enter a valid http(s) API URL and port.[/red]")
-                return
-            if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-                console.print("[red]Enter an http(s) API URL without credentials, query or fragment.[/red]")
-                return
-            target = infer_legacy_provider(new_url)
-            if target != "custom" and target != self.provider:
-                console.print(f"[yellow]That URL belongs to {target}. Use /provider {target} instead.[/yellow]")
-                return
-            if new_url != self.base_url:
-                console.print("[yellow]Future requests may send your conversation and this provider's API key to the new endpoint.[/yellow]")
-                if not Confirm.ask(f"Use endpoint on {parsed.hostname}?", default=False):
-                    console.print("[dim]Endpoint change cancelled.[/dim]")
-                    return
-            profile["base_url"] = new_url
-        elif action == "key":
-            env_name = Prompt.ask("Environment variable containing the API key", default=profile.get("api_key_env") or "")
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
-                console.print("[red]Enter an environment variable name, not the secret itself.[/red]")
-                return
-            profile["api_key_env"] = env_name
-            profile.pop("api_key", None)
-            profile.pop("legacy_credentials", None)
-            profile.pop("legacy_api_key_fallback", None)
-        elif action == "model":
-            self._select_model(Prompt.ask("Exact model ID", default=""))
-            return
-        else:
-            return
-        self._commit_provider_settings(candidate)
-        if action == "key" and not self.api_key:
-            console.print(f"[yellow]{profile.get('api_key_env')} is not set in Nano's process; set it and restart Nano.[/yellow]")
-        else:
-            console.print("[green]Provider configuration updated.[/green]")
-
-    def _handle_undo(self):
-        """Interactive /undo: list recent workspace snapshots and restore
-        the newest one after explicit confirmation."""
-        snapshots = self.snapshots.items()
-        if not snapshots:
-            console.print("[dim]No snapshots yet — one is taken automatically before "
-                          "the first file-changing tool (write/edit/shell) runs.[/dim]")
-            return
-        snapshot_table = Table(title="Workspace Snapshots", expand=True, border_style="magenta")
-        snapshot_table.add_column("Time", style="cyan", no_wrap=True)
-        snapshot_table.add_column("Taken before", style="white")
-        for item in snapshots[:5]:
-            taken = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(item["time"]))
-            snapshot_table.add_row(taken, escape(item["label"]))
-        console.print(Panel(snapshot_table, border_style="magenta"))
-
-        if not self.interactive:
-            # Restoring overwrites files; never do that without a human confirm.
-            console.print("[yellow]Undo requires an interactive session (it restores files after confirmation).[/yellow]")
-            return
-        latest = snapshots[0]
-        taken = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest["time"]))
-        if not Confirm.ask(f"Restore workspace to {taken} (before: {latest['label']})?", default=False):
-            console.print("[dim]Undo cancelled.[/dim]")
-            return
-        try:
-            summary = self.snapshots.restore(latest)
-            console.print(f"[bold green]✓ Restored {summary['files']} files from snapshot "
-                          f"taken {taken} (before: {escape(summary['label'])}).[/bold green]")
-            console.print("[dim]Files created after the snapshot are not removed by the restore.[/dim]")
-        except Exception as restore_error:
-            console.print(f"[bold red]Undo failed: {escape(str(restore_error))}[/bold red]")
-
-    def _repair_interrupted_transcript(self):
-        """Synthesize tool results for any pending tool calls so the transcript
-        stays valid — an unanswered tool call makes every later request 400."""
-        if not self.messages:
-            return
-        last = self.messages[-1]
-        if last.get("role") != "assistant" or not last.get("tool_calls"):
-            return
-        for tc in last["tool_calls"]:
-            self.messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": tc["function"]["name"],
-                "content": "Error: execution was interrupted before this tool completed.",
-            })
-        console.print("[yellow]⚠ Interrupted mid-tool; transcript repaired so the session stays usable.[/yellow]")
-
-    def _debug_print(self, message: str):
-        """Prints telemetry lines only when /debug telemetry is enabled."""
-        if self.debug_enabled:
-            console.print(f"[dim cyan]{message}[/dim cyan]")
+                return json.loads(config_path.read_text())
+            except:
+                pass
+        return {}
 
     def _register_core_tools(self):
-        async def spawn_sub_agent(goal: str):
-            if getattr(self, "is_subagent", False) or self.session is None:
-                return "Error: Sub-agents cannot spawn further sub-agents to prevent recursive loops."
-            sub = Nano(tools_dir=str(self.registry.tools_dir), model=self.model,
-                       confirm_callback=self.confirm_callback, is_subagent=True,
-                       provider_config=self.provider_settings.serialized(),
-                       auto_approve=self.auto_approve)
-            sub.messages[0]["content"] = f"You are a Nano sub-agent. Your specific goal is: {goal}. Provide a final answer when complete."
-            return await sub.run(goal)
+        async def write_tool(registry, filename: str, code: str):
+            if not filename.endswith(".py"): return "Error: filename must end in .py"
+            path = registry.tools_dir / filename
+            path.write_text(code)
+            return f"Tool written to {path}. Call reload_tools() to activate."
         
-        spawn_sub_agent.__doc__ = "Spawns a specialized sub-agent for complex multi-step tasks. DO NOT use for simple direct actions."
-        # Only the top-level agent may delegate; sub-agents don't get the
-        # tool registered at all so they can't waste a round on it.
-        if not getattr(self, "is_subagent", False):
-            self.registry.tools["spawn_sub_agent"] = spawn_sub_agent
-            self.registry.schemas.append(generate_tool_schema(spawn_sub_agent, priority=3))
+        async def reload_tools(registry):
+            registry.load_tools()
+            return f"Reloaded {len(registry.tools)} tools."
 
-        async def ask_user(question: str):
-            # Escape the model-generated question: brackets in it would be
-            # parsed as rich markup (MarkupError).
-            console.print(f"\n[bold yellow]❓ {escape(question)}[/bold yellow]")
-            # Use a simple prompt without the "Your Answer:" label to keep it clean
-            return Prompt.ask("", default="")
-        
-        ask_user.__doc__ = "Use this tool to ask the user for clarification, missing information, or a decision."
-        self.registry.tools["ask_user"] = ask_user
-        self.registry.schemas.append(generate_tool_schema(ask_user, priority=1))
+        async def test_tool(registry, script: str):
+            import subprocess, tempfile
+            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tf:
+                tf.write(script)
+                tmp_path = tf.name
+            try:
+                res = subprocess.run(["python3", tmp_path], capture_output=True, text=True, timeout=10)
+                return f"Passed: {res.stdout}" if res.returncode == 0 else f"Failed: {res.stderr}"
+            finally:
+                if os.path.exists(tmp_path): os.unlink(tmp_path)
+
+        # Set metadata and register
+        core_tools = {
+            "write_tool": (write_tool, "Writes a new tool implementation to the tools directory.", True),
+            "reload_tools": (reload_tools, "Reloads the tool registry.", False),
+            "test_tool": (test_tool, "Executes a script to verify tool behavior.", True),
+        }
+
+        for name, (func, doc, unsafe) in core_tools.items():
+            func.__doc__ = doc
+            if unsafe:
+                self.registry.unsafe_tools.add(name)
+            self.registry.tools[name] = func
+            self.registry.schemas.append(self.registry.generate_tool_schema(func))
 
     async def run(self, user_input: str):
-        # Delegated goals are untrusted task text, never local UI commands.
-        if self.session is None:
-            return await self._run_goal(user_input)
-        user_input_strip = user_input.strip()
-        
-        # Strictly enforce that slash commands only work if they are the ONLY content
-        # This prevents the agent from interpreting "/" in a sentence as a command.
-        if user_input_strip.startswith("/"):
-            # Split by whitespace to see if there are multiple words
-            parts = user_input_strip.split()
-            
-            # For commands that take arguments (like /save or /provider), 
-            # they are allowed as long as they are the only "instruction" in the message.
-            # We check if the command is one of our recognized triggers.
-            
-            if user_input_strip == "/help":
-                help_table = Table(title="Nano Slash Commands", expand=True, border_style="magenta")
-                help_table.add_column("Command", style="cyan", no_wrap=True)
-                help_table.add_column("Description", style="white")
-                help_table.add_row("/help", "Show this list of available slash commands")
-                help_table.add_row("/save <name>", "Archive current session with a name")
-                help_table.add_row("/sessions", "List and switch between past sessions")
-                help_table.add_row("/context", "View context imported from other agents")
-                help_table.add_row("/provider [name]", "Select a provider and its saved settings")
-                help_table.add_row("/model [model-id]", "Select a model for the active provider")
-                help_table.add_row("/config", "Configure the active provider's URL and key environment variable")
-                help_table.add_row("/debug", "Toggle request telemetry (rounds, tokens, timing, session saves)")
-                help_table.add_row("/clear", "Wipe current session history")
-                help_table.add_row("/tokens", "Show current session token usage")
-                help_table.add_row("/tools", "List all available agent tools")
-                help_table.add_row("/undo", "Restore workspace from the latest pre-edit snapshot")
-                help_table.add_row("/auto", "Toggle auto-approval of file edits and shell commands")
-                console.print(Panel(help_table, border_style="magenta"))
-                return "Help menu displayed."
-            
-            if user_input_strip == "/save":
-                console.print("[bold red]Error: Please provide a session name. (e.g. /save project-x)[/bold red]")
-                return "Save failed: missing name."
-            if user_input_strip.startswith("/save "):
-                name = user_input_strip[6:].strip()
-                if not name:
-                    console.print("[bold red]Error: Please provide a session name. (e.g. /save project-x)[/bold red]")
-                    return "Save failed: missing name."
-                
-                if self.session:
-                    self.session.save_session(self.messages, session_id=name)
-                    console.print(f"[bold green]✓ Session archived as {name}[/bold green]")
-                    return f"Session saved as {name}."
-                else:
-                    console.print("[bold red]Error: Session manager not available.[/bold red]")
-                    return "Save failed."
-            
-            if user_input_strip == "/sessions":
-                if self.session is None:
-                    console.print("[bold red]Session manager not available (sub-agent mode).[/bold red]")
-                    return "Session management is disabled for sub-agents."
-                
-                sessions = self.session.list_sessions()
-                if not sessions:
-                    console.print("[dim]No archived sessions found.[/dim]")
-                    return "No archived sessions."
-                
-                sess_table = Table(title="Past Sessions", expand=True, border_style="magenta")
-                sess_table.add_column("ID", style="cyan", no_wrap=True)
-                sess_table.add_column("Date", style="dim")
-                
-                for s in sessions:
-                    from datetime import datetime
-                    date_str = datetime.fromtimestamp(s["date"]).strftime("%Y-%m-%d %H:%M")
-                    sess_table.add_row(escape(s["id"]), date_str)
-                
-                console.print(Panel(sess_table, border_style="magenta"))
-                choice = Prompt.ask("\n[bold magenta]Enter Session ID to load (or press Enter to cancel)[/bold magenta]")
-                
-                if choice:
-                    self.session.save_session(self.messages, session_id=f"backup_{int(time.time())}")
-                    new_messages = self.session.load_session(session_id=choice)
-                    if new_messages:
-                        self.messages = new_messages
-                        self.messages[0] = {"role": "system", "content": self.system_prompt}
-                        console.print(f"[bold green]✓ Loaded session {choice}[/bold green]")
-                        return f"Switched to session {choice}."
-                    else:
-                        console.print("[bold red]Failed to load session.[/bold red]")
-                        return "Session load failed."
-                return "Session switch cancelled."
-            
-            if user_input_strip == "/clear":
-                if self.session:
-                    self.session.clear_session()
-                self.messages = [{"role": "system", "content": self.system_prompt}]
-                console.print("[bold green]✓ Session history cleared.[/bold green]")
-                return "Session cleared."
-            
-            if user_input_strip == "/tokens":
-                text = "".join([m.get("content", "") or "" for m in self.messages])
-                approx_tokens = len(text) // 4
-                console.print(Panel(f"Approximate Session Tokens: [bold cyan]{approx_tokens}[/bold cyan]", border_style="magenta"))
-                return f"Session tokens: ~{approx_tokens}"
-            
-            if user_input_strip == "/tools":
-                tools_table = Table(title="Available Tools", expand=True, border_style="magenta")
-                tools_table.add_column("Name", style="cyan")
-                tools_table.add_column("Description", style="white")
-                for s in self.registry.schemas:
-                    name = s["function"]["name"]
-                    desc = "No description available."
-                    if name in self.registry.tools:
-                        tool_fn = self.registry.tools[name]
-                        desc = tool_fn.__doc__ or "No description available."
-                    tools_table.add_row(escape(name), escape(desc))
-                console.print(Panel(tools_table, border_style="magenta"))
-                return f"Displayed {len(self.registry.schemas)} tools."
-            
-            if user_input_strip == "/context":
-                if not self.imported_context:
-                    console.print("[dim]No imported context found.[/dim]")
-                    return "No imported context."
-                ctx_table = Table(title="Imported Context", expand=True, border_style="magenta")
-                ctx_table.add_column("Source", style="cyan", width=12)
-                ctx_table.add_column("Role", style="magenta", width=10)
-                ctx_table.add_column("Content", style="white")
-                for source, msg in self.imported_context:
-                    content = msg.get("content", "")
-                    display_content = (content[:100] + "...") if len(content) > 100 else content
-                    # Imported content can contain file paths in brackets
-                    # ('[/foo/bar.py]'), which rich would parse as markup.
-                    ctx_table.add_row(source, msg.get("role", "unknown"), escape(display_content))
-                console.print(Panel(ctx_table, border_style="magenta"))
-                return f"Displayed {len(self.imported_context)} imported messages."
-            
-            if user_input_strip == "/provider":
-                self._handle_provider_selection()
-                return "Provider selection complete."
-            if user_input_strip.startswith("/provider "):
-                self._select_provider(user_input_strip[len("/provider "):].strip())
-                return "Provider selection complete."
-            if user_input_strip == "/model":
-                self._handle_model_selection()
-                return "Model selection complete."
-            if user_input_strip.startswith("/model "):
-                self._select_model(user_input_strip[len("/model "):].strip())
-                return "Model selection complete."
-            if user_input_strip == "/config":
-                self._handle_api_config()
-                return "Configuration updated."
-            if user_input_strip == "/debug":
-                self.debug_enabled = not self.debug_enabled
-                status = "enabled" if self.debug_enabled else "disabled"
-                console.print(f"[bold green]✓ Debug telemetry {status}.[/bold green]")
-                return f"Debug telemetry {status}."
-            if user_input_strip == "/undo":
-                self._handle_undo()
-                return "Undo handled."
-            if user_input_strip == "/auto":
-                self.auto_approve = not self.auto_approve
-                if self.auto_approve:
-                    console.print("[bold yellow]⚡ Auto-approve ENABLED — file edits and shell commands "
-                                  "run WITHOUT asking. Snapshots still taken for /undo. "
-                                  "Type /auto again to re-enable confirmations.[/bold yellow]")
-                else:
-                    console.print("[green]✓ Auto-approve disabled — unsafe tools will ask before running again.[/green]")
-                return f"Auto-approve {'enabled' if self.auto_approve else 'disabled'}."
-
-        return await self._run_goal(user_input)
-
-    async def _run_goal(self, user_input: str):
-        if not self.base_url:
-            console.print("[red]Set the active provider's endpoint with /config first.[/red]")
-            return "Provider endpoint not configured."
-        if not self.model:
-            console.print("[red]Select a model with /model first.[/red]")
-            return "Provider model not configured."
-        if not self.api_key:
-            env_name = self.provider_settings.current.get("api_key_env")
-            console.print(f"[red]API key unavailable. Set {env_name or 'the configured key environment variable'} and restart Nano.[/red]")
-            return "Provider API key not configured."
+        if user_input.startswith("/"): return await self._handle_command(user_input)
         self.messages.append({"role": "user", "content": user_input})
+        while True:
+            if self.debug: print(f'DEBUG: Sending {len(self.messages)} messages to provider...')
+            response = await self.provider.chat(self.messages)
+            if self.debug: print(f'DEBUG: Provider responded: {response}')
+            self.messages.append(response)
+            
+            if response.get('tool_calls'):
+                for tc in response['tool_calls']:
+                    name = tc['function']['name']
+                    args = json.loads(tc['function']['arguments'])
+                    schema = next((s for s in self.registry.schemas if s['function']['name'] == name), {})
+                    
+                    if schema.get('unsafe', False) and not self.auto_approve:
+                        if self.confirm_callback and not await self.confirm_callback(name, args):
+                            res = 'Error: Denied by user.'
+                        else:
+                            self.snapshots.snapshot(label=name)
+                            res = await self.registry.execute(name, args)
+                    else:
+                        res = await self.registry.execute(name, args)
+                    
+                    self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'name': name, 'content': res})
+                continue
+            return response['content']
+
+    async def _handle_command(self, cmd: str):
+        parts = cmd.split()
+        action = parts[0].lower()
         
-        tools_payload = [{"type": s["type"], "function": s["function"]} for s in self.registry.schemas]
-        tool_rounds = 0
-        try:
-            while True:
-                full_content = ""
-                tool_calls = []
-                md_pending = ""
-                round_started = time.time()
-                if self.debug_enabled:
-                    approx_tokens = sum(len(m.get("content") or "") for m in self.messages) // 4
-                    self._debug_print(f"→ round {tool_rounds + 1} · {escape(self.model)} · {len(self.messages)} msgs (~{approx_tokens} tok) · {len(tools_payload)} tools")
-                # Thinking indicator: animated spinner with a live elapsed-seconds
-                # counter. try/finally guarantees stop() runs even if the request
-                # or stream raises — a leaked live thread would redraw the screen
-                # forever and hide the prompt afterwards.
-                status_indicator = create_thinking_indicator(console)
-                status_indicator.start()
-                try:
-                    # Use a type-cast for messages to satisfy the OpenAI SDK's strict type checking
-                    stream = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=self.messages, # type: ignore
-                        # After too many tool rounds, stop offering tools so the
-                        # model is forced to give a final answer instead of
-                        # looping forever (unbounded token spend / session growth).
-                        tools=tools_payload if tool_rounds < MAX_TOOL_ROUNDS else None,
-                        tool_choice="auto" if tool_rounds < MAX_TOOL_ROUNDS else "none",
-                        stream=True
-                    )
-                    for chunk in stream:
-                        # Some providers send usage-only chunks with empty choices.
-                        if not chunk.choices:
-                            continue
-                        delta = chunk.choices[0].delta
-                        # Stop the spinner on the first visible data (text or tool call).
-                        if status_indicator is not None and (delta.content or delta.tool_calls):
-                            status_indicator.stop()
-                            status_indicator = None
-                        if delta.content:
-                            full_content += delta.content
-                            # Markdown streaming: buffer and render each
-                            # paragraph as soon as it completes, so styled
-                            # output appears while the response is arriving.
-                            md_pending += delta.content
-                            complete, md_pending = _split_complete_markdown(md_pending)
-                            if not complete and len(md_pending) > MAX_MD_PENDING:
-                                complete, md_pending = md_pending, ""
-                            if complete:
-                                _render_markdown_stream(complete)
-                        if delta.tool_calls:
-                            for tc_delta in delta.tool_calls:
-                                if tc_delta.index is None: continue
-                                while len(tool_calls) <= tc_delta.index:
-                                    tool_calls.append({"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
-                                tc = tool_calls[tc_delta.index]
-                                if tc_delta.id: tc["id"] = tc_delta.id
-                                if tc_delta.function.name: tc["function"]["name"] += tc_delta.function.name
-                                if tc_delta.function.arguments: tc["function"]["arguments"] += tc_delta.function.arguments
-                finally:
-                    # Always clean up: first token already stopped it (None), and
-                    # this covers empty streams, direct tool calls, and exceptions.
-                    if status_indicator is not None:
-                        status_indicator.stop()
-                # Flush any markdown remainder from the stream.
-                if md_pending:
-                    _render_markdown_stream(md_pending)
-                if tool_calls:
-                    # Some OpenAI-compatible providers never stream tool call IDs;
-                    # synthesize them so the tool messages can reference valid IDs
-                    # (a null tool_call_id makes the next request fail with 400).
-                    for i, tc in enumerate(tool_calls):
-                        if not tc.get("id"):
-                            tc["id"] = f"call_{i}"
-                if self.debug_enabled:
-                    summary = f"{len(full_content)} chars out" if full_content else "no text output"
-                    if tool_calls:
-                        summary += f" · {len(tool_calls)} tool call(s)"
-                    self._debug_print(f"← round done in {time.time() - round_started:.1f}s · {summary}")
-                if full_content:
-                    console.print()
-                msg_obj = {"role": "assistant", "content": full_content or None}
-                if tool_calls:
-                    msg_obj["tool_calls"] = tool_calls
-                self.messages.append(msg_obj)
-                if tool_calls:
-                    tasks = []
-                    for tc in tool_calls:
-                        tasks.append(self._execute_tool_wrapper(tc))
-                    
-                    tool_results = await asyncio.gather(*tasks)
-                    
-                    for tc, result in zip(tool_calls, tool_results):
-                        self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": tc["function"]["name"], "content": result})
-                    
-                    tool_rounds += 1
-                    if tool_rounds >= MAX_TOOL_ROUNDS:
-                        console.print("[yellow]⚠ Tool loop limit reached; asking the model for a final answer.[/yellow]")
-                        self.messages.append({"role": "user", "content": "System: tool iteration limit reached. Answer now with the information you have; do not call more tools."})
-                    
-                    if self.session:
-                        self.session.save_session(self.messages)
-                        self._debug_print(f"session saved ({len(self.messages)} messages)")
-                    continue 
-                else:
-                    if self.session:
-                        self.session.save_session(self.messages)
-                        self._debug_print(f"session saved ({len(self.messages)} messages)")
-                    return full_content
-        except KeyboardInterrupt:
-            # Ctrl+C cancels the turn. First, keep the transcript valid: if we
-            # were interrupted between the assistant's tool calls and their
-            # results, the next request would fail with 400 — synthesize the
-            # missing tool results, save, then let the cancel propagate.
-            self._repair_interrupted_transcript()
-            if self.session:
-                self.session.save_session(self.messages)
-            raise
+        if action == "/help":
+            return "Nano Commands:\\n/undo - Restore last snapshot\\n/clear - Clear session\\n/auto - Toggle auto-approve\\n/save - Manual snapshot\\n/models - Model & Provider Picker\\n/status - System status"
+        
+        if action == "/undo":
+            if not self.snapshots.history: return "No snapshots available."
+            self.snapshots.restore(self.snapshots.history[0])
+            return "Workspace restored to last snapshot."
+            
+        if action == "/clear":
+            self.messages = []
+            self.session.clear_session()
+            return "Session cleared."
+            
+        if action == "/auto":
+            self.auto_approve = not self.auto_approve
+            return f"Auto-approve is now {'enabled' if self.auto_approve else 'disabled'}."
 
-    async def _execute_tool_wrapper(self, tc: Dict[str, Any]) -> str:
-        name = tc["function"]["name"]
-        args_str = tc["function"]["arguments"]
-        try:
-            args = json.loads(args_str)
-        except json.JSONDecodeError:
-            # Never run a tool with silently-dropped arguments: a malformed
-            # or partially streamed JSON blob must fail loudly back to the model.
-            return f"Error: malformed tool arguments for {name}; refusing to execute with missing arguments."
+        if action == "/save":
+            self.snapshots.snapshot(label="Manual Save")
+            return "Manual snapshot created."
+            
+        if action == "/status":
+            return f"Status: Provider={self.provider_name}, Model={self.model}, Messages={len(self.messages)}"
 
-        schema = next((s for s in self.registry.schemas if s["function"]["name"] == name), {})
-        is_unsafe = schema.get("unsafe", False)
+        if action == "/models":
+            # 1. Fetch models
+            models = await self.provider.list_models()
+            
+            # 2. Display
+            console.print("\n[bold cyan]Model Picker[/bold cyan]")
+            console.print(f"Current: [yellow]{self.model}[/yellow]")
+            for i, m in enumerate(models, 1):
+                console.print(f"{i}: {m}")
+            console.print("\n[dim]Enter number to switch, '/p' to change provider, or 'q' to cancel[/dim]")
+            
+            choice = await self.prompt_session.prompt_async("❯ ")
+            
+            if choice.lower() == 'q': return "Cancelled."
+            if choice.lower() == '/p':
+                # Trigger provider picker
+                return await self._handle_command("/provider")
+            
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(models):
+                    new_model = models[idx]
+                    self.settings.profiles[self.settings.active]["model"] = new_model
+                    self.provider.model = new_model
+                    self.model = new_model
+                    self.settings.save()
+                    return f"Switched to model: {new_model}"
+            except ValueError:
+                if choice in models:
+                    self.settings.profiles[self.settings.active]["model"] = choice
+                    self.provider.model = choice
+                    self.model = choice
+                    self.settings.save()
+                    return f"Switched to model: {choice}"
+            
+            return "Invalid selection."
 
-        try:
-            if is_unsafe:
-                if self.auto_approve:
-                    # Permission dialogs are skipped in auto mode; the
-                    # snapshot below still runs as the rollback safety net.
-                    console.print(f"[dim]⚡ auto-approved {escape(name)}[/dim]")
-                elif self.confirm_callback is None:
-                    return "Error: Unsafe tool requires a confirmation callback; execution denied."
-                elif not self.confirm_callback(name, args):
-                    console.print(f"[red]✘ User denied execution of {escape(name)}[/red]")
-                    return "Error: User denied execution of this tool."
-                # Approved destructive calls get a rollback point first, so
-                # /undo can always put the workspace back.
-                self.snapshots.snapshot(label=name)
+        if action == "/provider":
+            # 1. Display providers
+            providers = list(self.settings.profiles.keys())
+            console.print("\n[bold cyan]Provider Manager[/bold cyan]")
+            console.print(f"Current: [yellow]{self.provider_name}[/yellow]")
+            for i, p in enumerate(providers, 1):
+                console.print(f"{i}: {p}")
+            console.print("\n[dim]Enter number to switch, '/a' to add provider, or 'q' to cancel[/dim]")
+            
+            choice = await self.prompt_session.prompt_async("❯ ")
+            
+            if choice.lower() == 'q': return "Cancelled."
+            if choice.lower() == '/a':
+                # Add Provider Flow
+                name = await self.prompt_session.prompt_async("Provider name: ")
+                if not name: return "Name required."
+                url = await self.prompt_session.prompt_async("Base URL: ")
+                if not url: return "URL required."
+                key = await self.prompt_session.prompt_async("API Key (optional): ")
+                
+                self.settings.profiles[name] = {
+                    "base_url": url,
+                    "api_key": key if key else None,
+                    "api_key_env": None,
+                    "model": "",
+                    "manual_models": []
+                }
+                self.settings.save()
+                return f"Provider {name} added. Use index to select it."
 
-            return await self._execute_tool(name, args)
-        except Exception as e:
-            # This MUST return a string, never raise: the caller appends the
-            # result as the tool message, and an unanswered tool call would
-            # corrupt the transcript (every later request would 400).
-            return f"Error during execution of {name}: {e}"
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(providers):
+                    new_prov = providers[idx]
+                    self.settings.active = new_prov
+                    # Re-init provider
+                    from nano_agent.providers import OpenAICompatibleProvider
+                    self.provider = OpenAICompatibleProvider(self.settings)
+                    self.provider_name = self.settings.active
+                    self.model = self.settings.current["model"]
+                    self.settings.save()
+                    return f"Switched to provider: {new_prov}. Please run /models to pick a model."
+            except ValueError:
+                if choice in providers:
+                    # Same logic as above...
+                    new_prov = choice
+                    self.settings.active = new_prov
+                    from nano_agent.providers import OpenAICompatibleProvider
+                    self.provider = OpenAICompatibleProvider(self.settings)
+                    self.provider_name = self.settings.active
+                    self.model = self.settings.current["model"]
+                    self.settings.save()
+                    return f"Switched to provider: {new_prov}."
+            
+            return "Invalid selection."
 
-    async def _execute_tool(self, name: str, args: dict) -> str:
-        render_tool_call(name, args)
-        started = time.time()
-        result = await self.registry.execute(name, args)
-        self._debug_print(f"… {escape(name)} in {time.time() - started:.2f}s · {len(result)} chars")
-        render_tool_result(result)
-        return result
+        if action == "/debug":
+            self.debug = not self.debug
+            return f"Debug mode is now {'enabled' if self.debug else 'disabled'}."
+        
+        return f"Unknown command: {action}"
