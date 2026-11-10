@@ -1,10 +1,9 @@
-
-"""Provider-scoped configuration for OpenAI-compatible endpoints."""
+"Provider-scoped configuration for OpenAI-compatible endpoints."
 
 import copy
 import os
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
 from urllib.parse import urlparse
 from openai import AsyncOpenAI
@@ -67,11 +66,11 @@ class ProviderSettings:
 
     def serialized(self) -> Dict[str, Any]:
         return {"active_provider": self.active, "providers": copy.deepcopy(self.profiles)}
+
     def save(self):
         config_path = Path.home() / ".nano.json"
         with open(config_path, "w") as f:
             json.dump(self.serialized(), f, indent=2)
-
 
 class OpenAICompatibleProvider:
     def __init__(self, settings: ProviderSettings):
@@ -83,10 +82,11 @@ class OpenAICompatibleProvider:
         )
         self.model = profile["model"]
 
-    async def chat(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    async def chat(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         response = await self.client.chat.completions.create(
             model=self.model,
-            messages=messages
+            messages=messages, # type: ignore
+            tools=tools # type: ignore
         )
         msg = response.choices[0].message
         return {
@@ -102,10 +102,10 @@ class OpenAICompatibleProvider:
                 for tc in (msg.tool_calls or [])
             ]
         }
+
     async def list_models(self) -> List[str]:
         try:
             response = await self.client.models.list()
             return [m.id for m in response.data]
         except Exception as e:
             return [f"Error fetching models: {e}"]
-

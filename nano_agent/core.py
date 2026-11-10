@@ -71,8 +71,6 @@ class ToolRegistry:
         if name not in self.tools: return f"Error: Tool {name} not found."
         func = self.tools[name]
         try:
-            # Pass self (the registry) if the tool expects it, or just args
-            # Standard Nano tools usually take (registry, **args)
             return await func(self, **args) if inspect.iscoroutinefunction(func) else func(self, **args)
         except Exception as e: return f"Tool execution error: {str(e)}"
 
@@ -82,7 +80,7 @@ class SnapshotManager:
         self.history: List[Dict[str, Any]] = []
 
     def snapshot(self, label: str):
-        state = {str(f): f.read_text() for f in self.root_dir.rglob("*.py")}
+        state = {str(f): f.read_text() for f in self.root_dir.rglob("*.py") if f.is_file()}
         self.history.insert(0, {"time": time.time(), "label": label, "state": state})
         self.history = self.history[:10]
 
@@ -144,6 +142,8 @@ class Nano:
         self.session = SessionManager()
         self.prompt_session: Any = None
         self.debug = False
+        self.cwd = os.getcwd()
+        
         self._register_core_tools()
 
     def _load_config(self):
@@ -177,7 +177,6 @@ class Nano:
             finally:
                 if os.path.exists(tmp_path): os.unlink(tmp_path)
 
-        # Set metadata and register
         core_tools = {
             "write_tool": (write_tool, "Writes a new tool implementation to the tools directory.", True),
             "reload_tools": (reload_tools, "Reloads the tool registry.", False),
@@ -193,10 +192,17 @@ class Nano:
 
     async def run(self, user_input: str):
         if user_input.startswith("/"): return await self._handle_command(user_input)
+        
+        if not self.messages or self.messages[0]["role"] != "system":
+            sys_msg = f"You are Nano, a transparent, recursive, provider-agnostic AI agent shell. You run in a local terminal environment at {self.cwd}. Your goal is to be a helpful, high-agency assistant that uses tools to interact with the filesystem and execute code. You should always be transparent about your process and avoid generic 'AI assistant' canned responses. When asked about your location or environment, refer to your CWD: {self.cwd}."
+            self.messages.insert(0, {"role": "system", "content": sys_msg})
+
         self.messages.append({"role": "user", "content": user_input})
         while True:
             if self.debug: print(f'DEBUG: Sending {len(self.messages)} messages to provider...')
-            response = await self.provider.chat(self.messages)
+            
+            response = await self.provider.chat(self.messages, tools=self.registry.schemas)
+            
             if self.debug: print(f'DEBUG: Provider responded: {response}')
             self.messages.append(response)
             
@@ -224,7 +230,7 @@ class Nano:
         action = parts[0].lower()
         
         if action == "/help":
-            return "Nano Commands:\\n/undo - Restore last snapshot\\n/clear - Clear session\\n/auto - Toggle auto-approve\\n/save - Manual snapshot\\n/models - Model & Provider Picker\\n/status - System status"
+            return "Nano Commands:\\n/undo - Restore last snapshot\\n/clear - Clear session\\n/auto - Toggle auto-approve\\n/save - Manual snapshot\\n/models - Model & Provider Picker\\n/status - System status\\n/debug - Toggle telemetry"
         
         if action == "/undo":
             if not self.snapshots.history: return "No snapshots available."
@@ -247,11 +253,53 @@ class Nano:
         if action == "/status":
             return f"Status: Provider={self.provider_name}, Model={self.model}, Messages={len(self.messages)}"
 
+        if action == "/debug":
+            self.debug = not self.debug
+            return f"Debug mode is now {'enabled' if self.debug else 'disabled'}."
+
         if action == "/models":
-            # 1. Fetch models
+            if len(parts) > 1:
+                target = parts[1]
+                if "/" in target:
+                    try:
+                        prov_name, model_name = target.split("/", 1)
+                        if prov_name in self.settings.profiles:
+                            # 1. Update settings first
+                            self.settings.active = prov_name
+                            profile = self.settings.profiles[prov_name]
+                            profile["model"] = model_name
+                            if model_name not in profile["manual_models"]:
+                                profile["manual_models"].append(model_name)
+                            self.settings.save()
+                            
+                            # 2. Attempt to initialize provider
+                            try:
+                                self.provider = OpenAICompatibleProvider(self.settings)
+                                self.provider_name = prov_name
+                                self.model = model_name
+                                return f"Switched to {prov_name} | {model_name}"
+                            except Exception as e:
+                                return f"Settings updated, but could not connect to provider: {e}"
+                        else:
+                            return f"Provider {prov_name} not found."
+                    except Exception as e:
+                        return f"Error switching: {e}"
+                else:
+                    model_name = target
+                    profile = self.settings.profiles[self.settings.active]
+                    profile["model"] = model_name
+                    if model_name not in profile["manual_models"]:
+                        profile["manual_models"].append(model_name)
+                    self.settings.save()
+                    try:
+                        self.provider.model = model_name
+                        self.model = model_name
+                        return f"Switched to model: {model_name}"
+                    except Exception as e:
+                        return f"Model updated in config, but provider error: {e}"
+
+            # Interactive picker logic
             models = await self.provider.list_models()
-            
-            # 2. Display
             console.print("\n[bold cyan]Model Picker[/bold cyan]")
             console.print(f"Current: [yellow]{self.model}[/yellow]")
             for i, m in enumerate(models, 1):
@@ -259,51 +307,51 @@ class Nano:
             console.print("\n[dim]Enter number to switch, '/p' to change provider, or 'q' to cancel[/dim]")
             
             choice = await self.prompt_session.prompt_async("❯ ")
-            
             if choice.lower() == 'q': return "Cancelled."
-            if choice.lower() == '/p':
-                # Trigger provider picker
-                return await self._handle_command("/provider")
+            if choice.lower() == '/p': return await self._handle_command("/provider")
             
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < len(models):
                     new_model = models[idx]
-                    self.settings.profiles[self.settings.active]["model"] = new_model
+                    profile = self.settings.profiles[self.settings.active]
+                    profile["model"] = new_model
+                    if new_model not in profile["manual_models"]:
+                        profile["manual_models"].append(new_model)
                     self.provider.model = new_model
                     self.model = new_model
                     self.settings.save()
                     return f"Switched to model: {new_model}"
             except ValueError:
                 if choice in models:
-                    self.settings.profiles[self.settings.active]["model"] = choice
+                    profile = self.settings.profiles[self.settings.active]
+                    profile["model"] = choice
+                    if choice not in profile["manual_models"]:
+                        profile["manual_models"].append(choice)
                     self.provider.model = choice
                     self.model = choice
                     self.settings.save()
                     return f"Switched to model: {choice}"
-            
             return "Invalid selection."
 
+
+
         if action == "/provider":
-            # 1. Display providers
             providers = list(self.settings.profiles.keys())
-            console.print("\n[bold cyan]Provider Manager[/bold cyan]")
+            console.print("\\n[bold cyan]Provider Manager[/bold cyan]")
             console.print(f"Current: [yellow]{self.provider_name}[/yellow]")
             for i, p in enumerate(providers, 1):
                 console.print(f"{i}: {p}")
-            console.print("\n[dim]Enter number to switch, '/a' to add provider, or 'q' to cancel[/dim]")
+            console.print("\\n[dim]Enter number to switch, '/a' to add provider, or 'q' to cancel[/dim]")
             
             choice = await self.prompt_session.prompt_async("❯ ")
-            
             if choice.lower() == 'q': return "Cancelled."
             if choice.lower() == '/a':
-                # Add Provider Flow
                 name = await self.prompt_session.prompt_async("Provider name: ")
                 if not name: return "Name required."
                 url = await self.prompt_session.prompt_async("Base URL: ")
                 if not url: return "URL required."
                 key = await self.prompt_session.prompt_async("API Key (optional): ")
-                
                 self.settings.profiles[name] = {
                     "base_url": url,
                     "api_key": key if key else None,
@@ -311,16 +359,20 @@ class Nano:
                     "model": "",
                     "manual_models": []
                 }
+                self.settings.active = name
+                from nano_agent.providers import get_provider
+                self.provider = OpenAICompatibleProvider(self.settings)
+                self.provider_name = name
+                self.model = self.settings.current["model"]
                 self.settings.save()
-                return f"Provider {name} added. Use index to select it."
+                return f"Provider {name} added and activated. Please run /models to pick a model."
 
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < len(providers):
                     new_prov = providers[idx]
                     self.settings.active = new_prov
-                    # Re-init provider
-                    from nano_agent.providers import OpenAICompatibleProvider
+                    from nano_agent.providers import get_provider
                     self.provider = OpenAICompatibleProvider(self.settings)
                     self.provider_name = self.settings.active
                     self.model = self.settings.current["model"]
@@ -328,20 +380,14 @@ class Nano:
                     return f"Switched to provider: {new_prov}. Please run /models to pick a model."
             except ValueError:
                 if choice in providers:
-                    # Same logic as above...
                     new_prov = choice
                     self.settings.active = new_prov
-                    from nano_agent.providers import OpenAICompatibleProvider
+                    from nano_agent.providers import get_provider
                     self.provider = OpenAICompatibleProvider(self.settings)
                     self.provider_name = self.settings.active
                     self.model = self.settings.current["model"]
                     self.settings.save()
                     return f"Switched to provider: {new_prov}."
-            
             return "Invalid selection."
 
-        if action == "/debug":
-            self.debug = not self.debug
-            return f"Debug mode is now {'enabled' if self.debug else 'disabled'}."
-        
         return f"Unknown command: {action}"
